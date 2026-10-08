@@ -1,0 +1,21 @@
+services:
+  gguf-manager:
+    build: .
+    container_name: gguf-manager
+    ports:
+      - "8200:8200"
+    volumes:
+      # 模型持久化目录（宿主机路径可自定义）
+      - ./models:/app/models
+    environment:
+      # 国内加速镜像（留空则使用官方源）
+      - HF_ENDPOINT=https://hf-mirror.com
+      # HuggingFace Token（下载 gated 模型时需要）
+      - HF_TOKEN=${HF_TOKEN:-}
+      # 模型存储目录
+      - MODEL_DIR=/app/models
+      # 搜索返回上限
+      - SEARCH_LIMIT=50
+      # 启用 hf_transfer 加速下载
+      - HF_HUB_ENABLE_HF_TRANSFER=1
+    restart: unless-stopped

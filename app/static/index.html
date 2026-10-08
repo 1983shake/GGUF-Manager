@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GGUF 模型管理器</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <header>
+        <h1>🦙 GGUF 模型管理器</h1>
+        <nav>
+            <button class="tab active" data-tab="search">模型搜索</button>
+            <button class="tab" data-tab="local">本地管理</button>
+        </nav>
+    </header>
+
+    <main>
+        <!-- 搜索页面 -->
+        <section id="tab-search" class="tab-content active">
+            <div class="search-bar">
+                <select id="source-select">
+                    <option value="huggingface">HuggingFace</option>
+                    <option value="modelscope">ModelScope</option>
+                </select>
+                <input type="text" id="search-input" placeholder="输入模型名称模糊搜索...">
+                <label class="checkbox-label">
+                    <input type="checkbox" id="gguf-only" checked>
+                    仅显示含 GGUF 的模型
+                </label>
+                <button id="search-btn">搜索</button>
+            </div>
+            <div id="search-results"></div>
+        </section>
+
+        <!-- 本地管理页面 -->
+        <section id="tab-local" class="tab-content">
+            <div class="manage-bar">
+                <input type="text" id="scan-path" placeholder="扫描路径（留空使用默认目录）">
+                <button id="scan-btn">扫描本地模型</button>
+            </div>
+            <div id="local-results"></div>
+        </section>
+    </main>
+
+    <!-- 下载弹窗 -->
+    <div id="download-modal" class="modal hidden">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>选择要下载的 GGUF 文件</h3>
+                <button id="close-modal" class="close-btn">&times;</button>
+            </div>
+            <div id="gguf-file-list"></div>
+            <div class="modal-footer">
+                <button id="cancel-download">取消</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

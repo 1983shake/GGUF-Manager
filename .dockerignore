@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.git/
+.gitignore
+.env
+*.egg-info
+tests/
+.vscode/
+.idea/
+models/
+*.md
