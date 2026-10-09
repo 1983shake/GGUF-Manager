@@ -4,15 +4,24 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>GGUF 模型管理器</title>
-    <link rel="stylesheet" href="/static/style.css">
+    <!-- v=4 版本号：改动静态文件后避免浏览器拿旧缓存 -->
+    <link rel="stylesheet" href="/static/style.css?v=16">
 </head>
 <body>
     <header>
         <h1>🦙 GGUF 模型管理器</h1>
-        <nav>
-            <button class="tab active" data-tab="search">模型搜索</button>
-            <button class="tab" data-tab="local">本地管理</button>
-        </nav>
+
+        <div class="header-right">
+            <!-- 下载速度只在右下角任务面板显示，页面顶部不再重复 -->
+
+            <nav>
+                <button class="tab active" data-tab="search">模型搜索</button>
+                <button class="tab" data-tab="local">本地管理</button>
+                <button class="tab" data-tab="logs">运行日志</button>
+            </nav>
+
+            <button id="settings-btn" class="icon-btn" title="设置">⚙</button>
+        </div>
     </header>
 
     <main>
@@ -29,6 +38,7 @@
                     仅显示含 GGUF 的模型
                 </label>
                 <button id="search-btn">搜索</button>
+                <button id="size-retry" class="btn-secondary hidden">补算体积</button>
             </div>
             <div id="search-results"></div>
         </section>
@@ -36,27 +46,331 @@
         <!-- 本地管理页面 -->
         <section id="tab-local" class="tab-content">
             <div class="manage-bar">
-                <input type="text" id="scan-path" placeholder="扫描路径（留空使用默认目录）">
+                <!-- ⭐ 扫描路径已移到「设置 / 数据源与日志」，这里只保留扫描按钮 -->
                 <button id="scan-btn">扫描本地模型</button>
+                <span id="scan-path-badge" class="scan-path-badge"
+                      title="当前扫描路径，在「设置」里修改"></span>
+                <span id="schedule-badge" class="schedule-badge" title="定期检测更新状态"></span>
             </div>
+
+            <!-- 批量操作栏 -->
+            <div class="batch-bar">
+                <label class="checkbox-label">
+                    <input type="checkbox" id="select-all">
+                    全选
+                </label>
+                <span class="selected-count" id="selected-count">已选 0 个</span>
+                <div class="batch-actions">
+                    <span class="batch-label">批量操作</span>
+                    <button id="batch-check" class="btn-secondary">批量检测</button>
+                    <button id="batch-update" class="btn-secondary">批量更新</button>
+                    <button id="batch-delete" class="btn-danger">批量删除</button>
+                    <span class="batch-sep"></span>
+                    <button id="check-all-btn" class="btn-secondary">检测全部</button>
+                    <button id="update-all-btn" class="btn-secondary">更新全部</button>
+                    <span class="batch-sep"></span>
+                    <button id="clear-cache-btn" class="btn-secondary"
+                            title="删除所有下载中断留下的 .gguf.part 缓存文件">清理缓存</button>
+                </div>
+            </div>
+
             <div id="local-results"></div>
+        </section>
+
+        <!-- 日志页面 -->
+        <section id="tab-logs" class="tab-content">
+            <div class="log-panel">
+                <div class="log-toolbar">
+                    <div class="toolbar-group">
+                        <!-- ⭐ 级别选择已移除，只在「设置 / 数据源与日志」里配置。
+                             日志页面不再提供级别选项，避免两处配置互相打架。 -->
+                        <span id="log-level-badge" class="log-level-badge"
+                              title="当前生效的日志级别，在「设置」里修改">级别 INFO</span>
+
+                        <div class="log-search-wrap">
+                            <input type="text" id="log-search"
+                                   placeholder="过滤关键字，/正则/ 按正则匹配">
+                            <button id="log-search-clear" class="log-search-clear"
+                                    title="清除过滤">&times;</button>
+                        </div>
+
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="log-autoscroll" checked>
+                            自动滚动
+                        </label>
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="log-follow" checked>
+                            实时跟随
+                        </label>
+                    </div>
+
+                    <div class="toolbar-group toolbar-group-right">
+                        <span id="log-count" class="log-count">0 / 0</span>
+                        <button id="log-clear-view" class="btn-secondary">清空</button>
+                        <button id="log-refresh" class="btn-secondary">刷新</button>
+                        <button id="log-copy" class="btn-secondary">复制</button>
+                        <button id="log-export" class="btn-secondary">导出</button>
+                        <span id="log-status" class="log-status">
+                            <i class="status-dot"></i><span id="log-status-text">已暂停</span>
+                        </span>
+                    </div>
+                </div>
+
+                <div id="log-view" class="log-view">
+                    <div class="log-placeholder">切换到本页面后将自动加载并实时刷新日志...</div>
+                </div>
+            </div>
         </section>
     </main>
 
-    <!-- 下载弹窗 -->
+    <!-- 页脚：居中，项目名带 GitHub 图标 -->
+    <footer id="app-footer" class="app-footer">
+        <span class="footer-copyright">© 2026-<span id="footer-year">2026</span></span>
+        <a href="https://github.com/1983shake/GGUF-Manager"
+           target="_blank" rel="noopener noreferrer" class="footer-link">
+            <svg class="footer-github-icon" viewBox="0 0 16 16" aria-hidden="true"
+                 width="15" height="15" fill="currentColor">
+                <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38
+                         0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13
+                         -.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66
+                         .07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15
+                         -.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27
+                         .68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12
+                         .51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48
+                         0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8
+                         c0-4.42-3.58-8-8-8z"></path>
+            </svg>
+            <span>GGUF-Manager</span>
+        </a>
+        <span class="footer-sep">·</span>
+        <span id="footer-version" class="footer-version">v-</span>
+    </footer>
+
+    <!-- 文件列表弹窗（"查看"按钮打开） -->
     <div id="download-modal" class="modal hidden">
         <div class="modal-content">
             <div class="modal-header">
-                <h3>选择要下载的 GGUF 文件</h3>
+                <h3>GGUF 文件列表</h3>
                 <button id="close-modal" class="close-btn">&times;</button>
             </div>
             <div id="gguf-file-list"></div>
             <div class="modal-footer">
-                <button id="cancel-download">取消</button>
+                <button id="cancel-download">关闭</button>
             </div>
         </div>
     </div>
 
-    <script src="/static/app.js"></script>
+    <!-- 设置面板 -->
+    <div id="settings-modal" class="modal hidden">
+        <div class="modal-content modal-wide">
+            <div class="modal-header">
+                <h3>设置</h3>
+                <button id="close-settings" class="close-btn">&times;</button>
+            </div>
+
+            <div class="settings-body">
+                <fieldset class="settings-group">
+                    <legend>数据源与日志</legend>
+
+                    <label class="setting-row">
+                        <span class="setting-label">HuggingFace 镜像</span>
+                        <input type="text" id="set-hf-endpoint"
+                               placeholder="https://hf-mirror.com（留空使用官方源）"
+                               list="hf-endpoint-presets">
+                        <datalist id="hf-endpoint-presets">
+                            <option value="https://hf-mirror.com"></option>
+                            <option value="https://huggingface.co"></option>
+                        </datalist>
+                        <span class="setting-hint">
+                            国内访问建议填 https://hf-mirror.com；留空则使用官方源。修改后立即生效
+                        </span>
+                    </label>
+
+                    <label class="setting-row">
+                        <span class="setting-label">日志级别</span>
+                        <select id="set-log-level">
+                            <option value="DEBUG">DEBUG（含第三方库调试信息）</option>
+                            <option value="INFO">INFO（推荐）</option>
+                            <option value="WARNING">WARNING（仅警告与错误）</option>
+                            <option value="ERROR">ERROR（仅错误）</option>
+                            <option value="CRITICAL">CRITICAL（仅严重错误）</option>
+                        </select>
+                        <span class="setting-hint">
+                            控制日志页面能看到的最低级别，修改后立即生效
+                        </span>
+                    </label>
+
+                    <label class="setting-row">
+                        <span class="setting-label">日志保留条数</span>
+                        <input type="number" id="set-log-buffer" min="100" max="20000" step="100">
+                        <span class="setting-hint">
+                            内存环形缓冲区容量（100–20000），超出后自动淘汰最旧的记录
+                        </span>
+                    </label>
+
+                    <label class="setting-row">
+                        <span class="setting-label">模型扫描路径</span>
+                        <input type="text" id="set-scan-path"
+                               placeholder="留空使用模型目录（MODEL_DIR）">
+                        <span class="setting-hint">
+                            本地管理页默认扫描的目录；留空则用挂载的模型目录。
+                            可填容器内已挂载的其他目录，如 /app/external-models
+                        </span>
+                    </label>
+                </fieldset>
+
+                <fieldset class="settings-group">
+                    <legend>任务面板</legend>
+                    <!-- ⭐ 原「弹窗展示时长」已并入任务面板：
+                         通知消息不再单独浮窗，统一渲染在右下角面板里，
+                         所以只有一个时长设置，同时管消息存活与面板收起。 -->
+                    <!-- ⭐ 之前有两个时长设置（消息展示 / 面板收起），
+                         默认值都是 3 秒，实际是同一件事的两个名字。
+                         现在合并为一个：同时管通知消息的存活和面板自动收起。 -->
+                    <label class="setting-row">
+                        <span class="setting-label">面板展示时长（秒）</span>
+                        <input type="number" id="set-autohide" min="1" max="600" step="1">
+                        <span class="setting-hint">
+                            通知消息（下载完成、失败、清理结果等）的显示时长，
+                            同时也是全部下载结束后面板自动收起的倒计时。默认 3 秒；
+                            鼠标停留会暂停，最多再延长 5 秒；想长时间保留可填 600
+                        </span>
+                    </label>
+                </fieldset>
+
+                <fieldset class="settings-group">
+                    <legend>网络</legend>
+                    <label class="setting-row">
+                        <span class="setting-label">连接超时（秒）</span>
+                        <input type="number" id="set-hf-connect" min="1" max="120" step="1">
+                    </label>
+                    <label class="setting-row">
+                        <span class="setting-label">读取超时（秒）</span>
+                        <input type="number" id="set-hf-read" min="5" max="600" step="5">
+                        <span class="setting-hint">访问 hf-mirror 等镜像较慢，建议不小于 60 秒</span>
+                    </label>
+                    <label class="setting-row">
+                        <span class="setting-label">失败重试次数</span>
+                        <input type="number" id="set-hf-retries" min="1" max="10" step="1">
+                    </label>
+                    <label class="setting-row">
+                        <span class="setting-label">搜索总时限（秒）</span>
+                        <input type="number" id="set-hf-budget" min="10" max="300" step="5">
+                        <span class="setting-hint">超时后自动降级为轻量搜索，避免长时间无响应</span>
+                    </label>
+                </fieldset>
+
+                <fieldset class="settings-group">
+                    <legend>llama.cpp</legend>
+                    <label class="setting-row setting-inline">
+                        <input type="checkbox" id="set-llama-enabled">
+                        <span class="setting-label">启用 llama.cpp 集成</span>
+                    </label>
+                    <label class="setting-row">
+                        <span class="setting-label">服务端类型</span>
+                        <select id="set-llama-flavor">
+                            <option value="auto">自动探测（推荐）</option>
+                            <option value="router">llama.cpp 路由模式</option>
+                            <option value="llamaswap">llama-swap 代理</option>
+                            <option value="server">普通 llama-server（单模型）</option>
+                        </select>
+                        <span class="setting-hint">
+                            路由模式支持模型列表、加载/卸载与重新扫描；选错会导致切换失败
+                        </span>
+                    </label>
+
+                    <label class="setting-row">
+                        <span class="setting-label">服务地址</span>
+                        <input type="text" id="set-llama-url" placeholder="http://127.0.0.1:8080">
+                    </label>
+                    <label class="setting-row">
+                        <span class="setting-label">API Key（可选）</span>
+                        <input type="text" id="set-llama-key" placeholder="留空则不发送鉴权头">
+                    </label>
+                    <label class="setting-row setting-inline">
+                        <input type="checkbox" id="set-llama-on-download">
+                        <span class="setting-label">模型下载完成后自动重新加载</span>
+                    </label>
+                    <label class="setting-row">
+                        <span class="setting-label">重载方式</span>
+                        <select id="set-llama-mode">
+                            <option value="http">HTTP 请求</option>
+                            <option value="command">Shell 命令</option>
+                            <option value="none">不重载</option>
+                        </select>
+                    </label>
+                    <label class="setting-row" data-mode="http">
+                        <span class="setting-label">重载端点路径</span>
+                        <input type="text" id="set-llama-path" placeholder="/props">
+                    </label>
+                    <label class="setting-row" data-mode="command">
+                        <span class="setting-label">重载命令</span>
+                        <input type="text" id="set-llama-cmd" placeholder="docker restart llamacpp">
+                        <span class="setting-hint">支持 {model} / {model_path} 占位符</span>
+                    </label>
+                    <div class="setting-actions">
+                        <button id="llama-probe" class="btn-secondary">测试连接</button>
+                        <button id="llama-reload" class="btn-secondary">立即重载</button>
+                        <button id="llama-refresh" class="btn-secondary"
+                                title="让路由模式重新读取模型源">重新扫描</button>
+                        <button id="llama-models" class="btn-secondary"
+                                title="查看服务端当前识别到的模型">模型列表</button>
+                    </div>
+                    <div id="llama-model-list" class="llama-model-list hidden"></div>
+                    <span id="llama-probe-result" class="probe-result"></span>
+                </fieldset>
+
+                <fieldset class="settings-group">
+                    <legend>更新检测</legend>
+                    <label class="setting-row setting-inline">
+                        <input type="checkbox" id="set-update-enabled">
+                        <span class="setting-label">定期检测本地模型更新</span>
+                    </label>
+                    <label class="setting-row">
+                        <span class="setting-label">检测间隔（分钟）</span>
+                        <input type="number" id="set-update-interval" min="10" max="10080" step="10">
+                    </label>
+                </fieldset>
+            </div>
+
+            <div class="modal-footer">
+                <button id="settings-reset" class="btn-secondary">恢复环境变量默认值</button>
+                <span class="footer-spacer"></span>
+                <div class="footer-actions">
+                    <button id="settings-cancel" class="btn-secondary">取消</button>
+                    <button id="settings-save">保存</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 右下角下载进度面板 -->
+    <!-- ⭐ 精简后的任务面板：不显示标题与速度，底部不再放批量按钮
+         （取消在每个任务行上，已结束的记录随面板收起自动清掉） -->
+    <div id="task-panel" class="task-panel hidden">
+        <div class="task-panel-header">
+            <span class="task-panel-title" id="task-panel-toggle" title="折叠/展开">
+                <span class="task-spinner"></span>
+            </span>
+            <span class="task-panel-meta">
+                <span class="task-panel-caret" id="task-panel-caret">▾</span>
+                <!-- ⭐ 随时手动关闭，不必等自动收起 -->
+                <button id="task-panel-close" class="task-panel-close"
+                        title="关闭面板" aria-label="关闭面板">×</button>
+            </span>
+        </div>
+
+        <div class="task-panel-body" id="task-panel-body">
+            <!-- ⭐ 通知消息统一放在这里，不再单独浮一个弹窗 -->
+            <div id="task-panel-messages" class="task-panel-messages"></div>
+            <div id="task-list" class="task-list"></div>
+            <div class="task-panel-footer">
+                <!-- ⭐ 自动收起倒计时，让"什么时候消失"看得见 -->
+                <span id="task-autohide-hint" class="task-autohide-hint hidden"></span>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js?v=16"></script>
 </body>
 </html>

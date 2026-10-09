@@ -1,21 +1,34 @@
+# docker-compose.yml
+# 首次启动后 ./config/settings.json 会自动生成，也可直接编辑该文件。
+
 services:
   gguf-manager:
-    build: .
+    # 本地构建（用同目录下的 Dockerfile）
+    #build: .
+    # 使用已发布镜像时改为下面这行，并注释掉上面的 build
+    image: docker.cnb.cool/1983shake/gguf-manager:latest
     container_name: gguf-manager
+    restart: unless-stopped
+
     ports:
       - "8200:8200"
+
     volumes:
-      # 模型持久化目录（宿主机路径可自定义）
+      # 模型文件（大文件，建议放空间充足的盘）
       - ./models:/app/models
+
+      # ⭐ 配置持久化卷：Web 设置面板的所有改动都存这里，
+      - ./config:/app/config
+
+      # 可选：额外的只读模型目录，在 Web 的"扫描路径"里填 /app/external-models
+      # - /mnt/nas/models:/app/external-models:ro
+
     environment:
-      # 国内加速镜像（留空则使用官方源）
-      - HF_ENDPOINT=https://hf-mirror.com
-      # HuggingFace Token（下载 gated 模型时需要）
-      - HF_TOKEN=${HF_TOKEN:-}
-      # 模型存储目录
+      # 容器内模型目录（改挂载路径时同步调整）
       - MODEL_DIR=/app/models
-      # 搜索返回上限
-      - SEARCH_LIMIT=50
-      # 启用 hf_transfer 加速下载
-      - HF_HUB_ENABLE_HF_TRANSFER=1
-    restart: unless-stopped
+
+      # 配置目录：指向上面挂载的卷
+      - CONFIG_DIR=/app/config
+
+      # 日志时区。容器默认 UTC，这里设成北京时间
+      - LOG_TZ=Asia/Shanghai

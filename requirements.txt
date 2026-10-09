@@ -1,8 +1,19 @@
+# requirements.txt
+# 注意：本项目不依赖 modelscope SDK（ModelScope 搜索走 HTTP API），
+#       安装它会额外拉进几百 MB 的 torch 等依赖，这里刻意不装。
+
 fastapi==0.115.0
-uvicorn[standard]==0.32.0
-huggingface_hub==0.26.2
-modelscope==1.20.1
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+
+# HTTP 客户端：下载与 ModelScope 搜索走 httpx，huggingface_hub 走 requests
 httpx==0.27.2
-aiofiles==24.1.0
-python-multipart==0.0.12
-hf_transfer==0.1.9
+requests==2.32.3
+
+# HuggingFace Hub（仅用其 Hub API，不加载模型）
+huggingface_hub==0.26.2
+
+# ⭐ 时区数据库。日志时区用 zoneinfo 实现，Debian slim 默认不带 tzdata，
+#    缺失时 ZoneInfo("Asia/Shanghai") 会失败并回退到固定 UTC+8 偏移——
+#    对国内时间没错，但涉及夏令时的时区（如欧美）就会算错。
+tzdata==2024.2
