@@ -1,5 +1,5 @@
 """
-系统类路由（v1.3.0 合并自 config.py / logs.py / llamacpp.py）。
+系统类路由
 
 GET  /api/config          读取当前生效配置（含版本、是否可改）
 PUT  /api/config          修改白名单内的配置（来自 Web 设置面板）

@@ -10,8 +10,6 @@ POST   /api/tasks/{id}/cancel   取消任务（保留 .part 以支持断点续�
 DELETE /api/tasks/{id}          从列表移除记录（不删文件）
 POST   /api/tasks/clear         清除所有已结束的任务
 
-v1.3.0：任务状态变化通过事件总线推送，前端优先用 SSE 实时更新，
-        无需再依赖 800ms 轮询。
 """
 
 from fastapi import APIRouter, Query
@@ -62,8 +60,7 @@ def list_gguf_files(
 @router.post("/api/download")
 def start_download(req: DownloadRequest):
     logger.info(
-        f"[/api/download] model_id={req.model_id!r}, filename={req.filename!r}, "
-        f"source={req.source!r}, target_subdir={req.target_subdir!r}"
+        f"[/api/download] model_id={req.model_id!r}, filename={req.filename!r}, " f"source={req.source!r}, target_subdir={req.target_subdir!r}"
     )
 
     if req.target_subdir:

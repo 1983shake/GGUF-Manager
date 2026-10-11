@@ -1,5 +1,6 @@
-# requirements.txt
-# GGUF-Manager v1.3.0
+# ============================================================
+# GGUF-Manager requirements.txt
+# ============================================================
 # 注意：本项目不依赖 modelscope SDK（ModelScope 搜索走 HTTP API），
 #       安装它会额外拉进几百 MB 的 torch 等依赖，这里刻意不装。
 

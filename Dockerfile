@@ -1,5 +1,5 @@
 # ============================================================
-# GGUF-Manager v1.3.0 Dockerfile
+# GGUF-Manager Dockerfile
 # ============================================================
 ARG BASE_IMAGE=python:3.12-slim
 FROM ${BASE_IMAGE}

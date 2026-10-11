@@ -1,13 +1,14 @@
-# docker-compose.yml
-# GGUF-Manager v1.3.0
+# ============================================================
+# GGUF-Manager docker-compose.yml
+# ============================================================
 # 首次启动后 ./config/settings.json 会自动生成，也可直接编辑该文件。
 
 services:
   gguf-manager:
     # 本地构建（用同目录下的 Dockerfile）
-    #build: .
+    build: .
     # 使用已发布镜像时改为下面这行，并注释掉上面的 build
-    image: docker.cnb.cool/1983shake/gguf-manager:latest
+    #image: docker.cnb.cool/1983shake/gguf-manager:latest
     container_name: gguf-manager
     restart: unless-stopped
 

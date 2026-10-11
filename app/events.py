@@ -1,12 +1,7 @@
 """
 事件总线：让“状态变化”主动推送到前端，根治“更新状态不及时刷新”。
 
-v1.3.0 之前的实现是纯拉取式的：
-  · 后端做完检测/下载后只改注册表，不通知前端
-  · 前端靠手动点“检测/扫描”或每 800ms 轮询才能看到变化
-  · 定期检测在后台跑完，界面上完全无感
-
-现在改成事件驱动：任何会改变界面状态的操作完成后发一个事件，
+任何会改变界面状态的操作完成后发一个事件，
 GET /api/events 用 SSE（Server-Sent Events）把事件推给浏览器，
 前端据此精准刷新对应行/徽标，无需整表重扫、无需猜“该不该刷新”。
 
@@ -67,6 +62,7 @@ class EventBus:
     def subscribe(self):
         """生成一个新队列并注册；返回该队列（迭代器）。"""
         from collections import deque as _deque
+
         q = _deque()
         self._subscribers.append(q)
         return q
@@ -81,21 +77,16 @@ class EventBus:
 bus = EventBus()
 
 
-def emit_model_updated(rel_path: str, status: Optional[str] = None,
-                       reason: str = "change") -> None:
+def emit_model_updated(rel_path: str, status: Optional[str] = None, reason: str = "change") -> None:
     """模型记录变化（来源写入/更新检测完成）。"""
     bus.publish("model_updated", {"rel_path": rel_path, "status": status, "reason": reason})
 
 
-def emit_check_completed(summary: Optional[Dict[str, Any]] = None,
-                        results: Optional[list] = None) -> None:
+def emit_check_completed(summary: Optional[Dict[str, Any]] = None, results: Optional[list] = None) -> None:
     """一轮更新检测结束。results 只摘出 rel_path+status 精简下发。"""
     slim = None
     if results:
-        slim = [
-            {"rel_path": r.get("rel_path"), "status": r.get("status")}
-            for r in results
-        ]
+        slim = [{"rel_path": r.get("rel_path"), "status": r.get("status")} for r in results]
     bus.publish("check_completed", {"summary": summary or {}, "results": slim or []})
 
 
@@ -118,8 +109,4 @@ def emit_scheduler_tick(state: Optional[Dict[str, Any]] = None) -> None:
 def event_to_sse(event: Dict[str, Any]) -> str:
     """把事件对象序列化成 SSE 帧。data 行必须是 JSON 的单行载荷。"""
     payload = json.dumps(event.get("data", {}), ensure_ascii=False)
-    return (
-        f"id: {event['id']}\n"
-        f"event: {event['event']}\n"
-        f"data: {payload}\n\n"
-    )
+    return f"id: {event['id']}\n" f"event: {event['event']}\n" f"data: {payload}\n\n"

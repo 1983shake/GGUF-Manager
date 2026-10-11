@@ -10,8 +10,6 @@ POST   /api/models/update       更新模型（重新下载，完成后原子替
 POST   /api/models/clear-cache  清理 .gguf.part 缓存
 GET    /api/models/schedule     定期检测任务状态
 
-v1.3.0：扫描结果自带来源与更新状态（不再由前端二次拼接）；
-        检测完成/下载完成/注册表变更均通过事件总线推送，界面自动刷新。
 """
 
 from typing import Dict, List, Optional

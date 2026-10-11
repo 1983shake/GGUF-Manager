@@ -1,5 +1,5 @@
 """
-搜索路由（v1.3.0）。
+搜索路由
 
 GET /api/search        搜索模型（体积能带就带，带不上由前端懒加载补齐）
 GET /api/search/size   查询单个模型的 GGUF 总大小

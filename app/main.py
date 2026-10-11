@@ -4,10 +4,6 @@
 启动顺序：
   1. 加载配置 → 2. 初始化日志 → 3. 注册路由 → 4. 挂载静态文件 → 5. 启动更新调度器
 
-v1.3.0 主要变化：
-  · 新增 /api/events SSE 端点，状态变化主动推送
-  · 版本号统一来自 app/__init__.py（Web 页脚也读这里）
-  · 调度器改为幂等启动（已运行时不再起新线程）
 """
 
 import os
@@ -20,7 +16,10 @@ from fastapi.staticfiles import StaticFiles
 from app import __version__
 from app.config import settings, REGISTRY_FILENAME
 from app.logger import (
-    setup_logging, get_logger, get_timezone_name, set_timezone,
+    setup_logging,
+    get_logger,
+    get_timezone_name,
+    set_timezone,
 )
 from app.routers import models, downloads, sources, system
 from app.sources.updater import scheduler
@@ -31,10 +30,10 @@ logger = get_logger("app.main")
 app = FastAPI(title="GGUF Model Manager", version=__version__)
 
 # 路由注册：按职责分组
-app.include_router(models.router)        # /api/models
-app.include_router(downloads.router)     # /api/download, /api/tasks
-app.include_router(sources.router)       # /api/search
-app.include_router(system.router)        # /api/config, /api/logs, /api/llamacpp, /api/events
+app.include_router(models.router)  # /api/models
+app.include_router(downloads.router)  # /api/download, /api/tasks
+app.include_router(sources.router)  # /api/search
+app.include_router(system.router)  # /api/config, /api/logs, /api/llamacpp, /api/events
 
 # 静态文件（前端）
 static_dir = Path(__file__).parent / "static"
@@ -59,19 +58,13 @@ async def on_startup() -> None:
     logger.info(f"  LOG_LEVEL        = {settings.log_level}")
     logger.info(f"  LOG_BUFFER_SIZE  = {settings.log_buffer_size}")
     logger.info(f"  TOAST_DURATION   = {settings.task_panel_autohide}s")
-    logger.info(
-        f"  HF TIMEOUT       = {settings.hf_connect_timeout}s / {settings.hf_read_timeout}s "
-        f"(retries={settings.hf_max_retries})"
-    )
+    logger.info(f"  HF TIMEOUT       = {settings.hf_connect_timeout}s / {settings.hf_read_timeout}s " f"(retries={settings.hf_max_retries})")
     logger.info(
         f"  LLAMACPP         = enabled={settings.llamacpp_enabled} "
         f"url={settings.llamacpp_url or '-'} mode={settings.llamacpp_reload_mode} "
         f"reload_on_download={settings.llamacpp_reload_on_download}"
     )
-    logger.info(
-        f"  UPDATE CHECK     = enabled={settings.update_check_enabled} "
-        f"every {settings.update_check_interval_minutes} min"
-    )
+    logger.info(f"  UPDATE CHECK     = enabled={settings.update_check_enabled} " f"every {settings.update_check_interval_minutes} min")
     logger.info(f"  TIMEZONE         = {get_timezone_name()}")
     logger.info("=" * 62)
 
