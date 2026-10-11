@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>GGUF 模型管理器</title>
     <!-- v=4 版本号：改动静态文件后避免浏览器拿旧缓存 -->
-    <link rel="stylesheet" href="/static/style.css?v=16">
+    <link rel="stylesheet" href="/static/style.css?v=24">
 </head>
 <body>
     <header>
@@ -310,6 +310,8 @@
                     </label>
                     <div class="setting-actions">
                         <button id="llama-probe" class="btn-secondary">测试连接</button>
+                        <button id="llama-diagnose" class="btn-secondary"
+                                title="自动探测服务端类型并推荐正确配置">自动诊断</button>
                         <button id="llama-reload" class="btn-secondary">立即重载</button>
                         <button id="llama-refresh" class="btn-secondary"
                                 title="让路由模式重新读取模型源">重新扫描</button>
@@ -371,6 +373,6 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=16"></script>
+    <script src="/static/app.js?v=24"></script>
 </body>
 </html>

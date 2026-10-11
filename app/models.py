@@ -1,14 +1,13 @@
-# app/models.py
 """
 数据模型 + 体积工具。
 
-体积格式统一放在这里，避免 huggingface / modelscope / local_scanner
-三处各写一份不一致的实现。
+体积格式统一放在这里，避免 huggingface / modelscope / scanner 三处各写一份不一致的实现。
+所有 Pydantic 请求/响应模型也集中在此，前端看不到后端内部类型。
 """
 
 from typing import Optional, Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 _SIZE_UNITS = ["B", "KB", "MB", "GB", "TB", "PB"]
 
@@ -17,7 +16,7 @@ def human_size(size: Optional[Union[int, float]]) -> str:
     """
     把字节数转成人类可读字符串。
 
-    None / 负数 / 非数字 → ""（表示"未知"，与"大小为 0"严格区分）
+    None / 负数 / 非数字 → ""（表示“未知”，与“大小为 0”严格区分）
     """
     if size is None:
         return ""
@@ -44,22 +43,21 @@ def coerce_timestamp(value) -> Optional[float]:
     把各种形态的时间值统一成 POSIX 时间戳（秒，浮点）。
 
     上游返回的时间字段非常不统一：
-      - ModelScope 旧版给毫秒整数 LastModified
-      - 新版可能给 ISO 字符串 updated_at
-      - 有的实现给秒级整数
+      · ModelScope 旧版给毫秒整数 LastModified
+      · 新版可能给 ISO 字符串 updated_at
+      · 有的实现给秒级整数
     解析不了就返回 None —— 宁可少一个判据，也不能把脏数据当真。
     """
     if value is None or value == "":
         return None
 
-    # 数字：判断量级区分秒 / 毫秒 / 微秒
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         v = float(value)
         if v <= 0:
             return None
-        if v > 1e14:      # 微秒
+        if v > 1e14:
             return v / 1e6
-        if v > 1e11:      # 毫秒
+        if v > 1e11:
             return v / 1e3
         return v
 
@@ -70,21 +68,18 @@ def coerce_timestamp(value) -> Optional[float]:
     if not text:
         return None
 
-    # 纯数字字符串
     try:
         return coerce_timestamp(float(text))
     except ValueError:
         pass
 
-    # ISO 8601：兼容末尾 Z 与 +08:00
     try:
         from datetime import datetime
         iso = text.replace("Z", "+00:00")
         dt = datetime.fromisoformat(iso)
         if dt.tzinfo is None:
-            # 无时区信息按 UTC 处理
             import calendar
-            return calendar.timegm(dt.tutct())
+            return calendar.timegm(dt.utctimetuple())
         return dt.timestamp()
     except Exception:
         pass
@@ -97,7 +92,6 @@ def format_timestamp(ts) -> str:
     if ts is None:
         return ""
     try:
-        from datetime import datetime
         from app.logger import LOG_TZ
         return datetime.fromtimestamp(float(ts), LOG_TZ).strftime("%Y-%m-%d %H:%M")
     except Exception:
@@ -108,7 +102,7 @@ def sum_sizes(sizes) -> Optional[int]:
     """
     累加一批可能为 None 的字节数。
 
-    全为 None 时返回 None（表示"未知"），而不是 0 —— 0 会被误渲染成 "0 B"。
+    全为 None 时返回 None（表示“未知”），而不是 0 —— 0 会被误渲染成 "0 B"。
     """
     total = 0
     known = False
@@ -123,6 +117,9 @@ def sum_sizes(sizes) -> Optional[int]:
     return total if known else None
 
 
+# ============================================================
+# Pydantic 请求 / 响应模型
+# ============================================================
 class SearchResult(BaseModel):
     """搜索结果（含 GGUF 文件体积信息）。"""
 
@@ -135,18 +132,19 @@ class SearchResult(BaseModel):
     has_gguf: bool = False
     source: str = "huggingface"
 
-    # ---- 体积相关 ----
-    gguf_count: int = 0               # 仓库中 .gguf 文件数量
-    total_size: Optional[int] = None  # GGUF 文件总字节数；未知时为 None
-    total_size_human: str = ""        # 人类可读，如 "4.70 GB"；未知时为 ""
-    size_known: bool = False          # 是否已拿到真实体积
+    gguf_count: int = 0
+    total_size: Optional[int] = None
+    total_size_human: str = ""
+    size_known: bool = False
 
 
 class DownloadRequest(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     model_id: str
-    filename: str = ""  # HuggingFace 需要指定文件名
+    filename: str = ""
     source: str = "huggingface"
-    target_subdir: str = ""  # 可选，下载到模型目录的子目录
+    target_subdir: str = ""
 
 
 class LocalModel(BaseModel):
@@ -168,6 +166,8 @@ class GGUFFile(BaseModel):
 class ModelSize(BaseModel):
     """单个模型的体积查询结果（供前端懒加载）。"""
 
+    model_config = ConfigDict(protected_namespaces=())
+
     model_id: str
     source: str = "huggingface"
     gguf_count: int = 0
@@ -175,3 +175,10 @@ class ModelSize(BaseModel):
     total_size_human: str = ""
     size_known: bool = False
     error: str = ""
+
+
+class DownloadPatch(BaseModel):
+    """更新检测时传入的模型清单（rel_paths 与 file_paths 二选一）。"""
+
+    file_paths: list[str] = []
+    rel_paths: list[str] = []

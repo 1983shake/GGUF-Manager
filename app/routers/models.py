@@ -1,13 +1,17 @@
-# app/routers/manage.py
 """
-本地模型管理。
+本地模型管理路由。
 
 GET    /api/models              扫描本地模型（附带来源与更新状态）
-DELETE /api/models              删除单个文件（保留兼容）
+DELETE /api/models              删除单个文件
 POST   /api/models/batch-delete 批量删除
 POST   /api/models/check        检测更新（指定或全部）
+GET|POST /api/models/check-one  检测单个模型（供每行“检测”按钮）
 POST   /api/models/update       更新模型（重新下载，完成后原子替换）
+POST   /api/models/clear-cache  清理 .gguf.part 缓存
 GET    /api/models/schedule     定期检测任务状态
+
+v1.3.0：扫描结果自带来源与更新状态（不再由前端二次拼接）；
+        检测完成/下载完成/注册表变更均通过事件总线推送，界面自动刷新。
 """
 
 from typing import Dict, List, Optional
@@ -17,15 +21,11 @@ from pydantic import BaseModel
 
 from app.config import settings
 from app.logger import get_logger
-from app.services.downloader import manager
-from app.services.local_scanner import (
-    clear_cache,
-    delete_model,
-    scan_models,
-)
-from app.services.registry import registry
-from app.services import llamacpp
-from app.services.updater import check_all, check_one, scheduler
+from app.sources import llamacpp
+from app.sources.downloader import manager
+from app.sources.scanner import clear_cache, delete_model, scan_models
+from app.sources.registry import registry, rel_path_of
+from app.sources.updater import check_all, check_one, scheduler
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/models", tags=["models"])
@@ -45,21 +45,10 @@ def list_local_models(path: str = Query("", description="自定义扫描路径")
     logger.info(f"[/api/models] scan_dir={scan_dir!r}")
     models = scan_models(scan_dir)
 
-    # 只有在扫描默认目录时才附带来源信息（外部挂载目录没有注册表归属）
-    if not path:
-        reg = registry.all()
+    # 外部挂载目录没有注册表归属，不附加来源信息
+    if path:
         for m in models:
-            rec = reg.get(m["relative_path"])
-            if rec:
-                m["source"] = rec.get("source", "")
-                m["model_id"] = rec.get("model_id", "")
-                m["remote_filename"] = rec.get("filename", "")
-                m["last_check_status"] = rec.get("last_check_status")
-                m["last_checked_at"] = rec.get("last_checked_at")
-                m["has_update_info"] = True
-            else:
-                m["source"] = ""
-                m["model_id"] = ""
+            if "source" not in m:
                 m["has_update_info"] = False
 
     incomplete = [m for m in models if m.get("is_part")]
@@ -93,11 +82,8 @@ def remove_model(file_path: str = Query(...)):
         # ⭐ 删掉后通知 llama.cpp：路由模式不监听磁盘，
         #    不重新扫描的话服务端列表里还留着这个模型。
         if success:
-            notify = llamacpp.notify_models_changed(
-                reason="delete", names=_server_names_for(file_path)
-            )
+            notify = llamacpp_notify(reason="delete", file_path=file_path)
             return {"success": True, "llamacpp": notify}
-
         return {"success": False}
     except ValueError as e:
         logger.warning(f"[/api/models] delete rejected: {e}")
@@ -114,15 +100,11 @@ def batch_remove(req: PathsRequest):
     logger.info(f"[/api/models/batch-delete] {len(paths)} files")
 
     deleted, failed = [], []
-    rel_to_remove = []
 
     for p in paths:
         try:
-            rel = registry_rel(p)
             if delete_model(p, str(settings.MODEL_DIR)):
                 deleted.append(p)
-                if rel:
-                    rel_to_remove.append(rel)
             else:
                 failed.append({"path": p, "error": "文件不存在或不是 .gguf"})
         except ValueError as e:
@@ -131,16 +113,9 @@ def batch_remove(req: PathsRequest):
             logger.exception(f"[/api/models/batch-delete] {p} failed: {e}")
             failed.append({"path": p, "error": str(e)})
 
-    if rel_to_remove:
-        registry.remove_many(rel_to_remove)
-
-    # ⭐ 批量删除后同样要通知 llama.cpp 重新扫描
     llamacpp_notify = None
     if deleted:
-        names: List[str] = []
-        for p in deleted:
-            names.extend(_server_names_for(p))
-        llamacpp_notify = llamacpp.notify_models_changed(reason="delete", names=names)
+        llamacpp_notify = llamacpp_batch_notify(deleted, reason="delete")
 
     logger.info(f"[/api/models/batch-delete] deleted={len(deleted)} failed={len(failed)}")
     return {"success": len(failed) == 0, "deleted": deleted, "failed": failed,
@@ -150,7 +125,6 @@ def batch_remove(req: PathsRequest):
 def _server_names_for(file_path: str) -> List[str]:
     """算出本地文件在 llama.cpp 那边可能的模型名（用于卸载）。"""
     try:
-        # 优先用服务端列表里匹配到的真实名字
         matched = llamacpp.match_remote_name(file_path)
         if matched:
             return [matched]
@@ -159,10 +133,28 @@ def _server_names_for(file_path: str) -> List[str]:
         return []
 
 
-def registry_rel(abs_path: str):
+def llamacpp_notify(reason: str, file_path: str = "", names: Optional[List[str]] = None) -> Optional[Dict]:
+    """通知 llama.cpp 模型变化。"""
     try:
-        from pathlib import Path
-        return str(Path(abs_path).resolve().relative_to(Path(settings.MODEL_DIR).resolve()))
+        if names is None:
+            names = _server_names_for(file_path) if file_path else []
+        if not names:
+            return None
+        res = llamacpp.reload(reason=reason)
+        return res
+    except Exception as e:
+        logger.warning(f"[/api/models] llamacpp notify failed: {e}")
+        return None
+
+
+def llamacpp_batch_notify(deleted: List[str], reason: str) -> Optional[Dict]:
+    try:
+        names: List[str] = []
+        for p in deleted:
+            names.extend(_server_names_for(p))
+        if not names:
+            return None
+        return llamacpp.reload(reason=reason)
     except Exception:
         return None
 
@@ -196,9 +188,7 @@ def clear_part_cache():
 # ------------------------------------------------------------
 @router.post("/check")
 def check_updates(req: PathsRequest):
-    """
-    检测更新。rel_paths 为空则检测所有有来源记录的模型。
-    """
+    """检测更新。rel_paths 为空则检测所有有来源记录的模型。"""
     targets = req.rel_paths or None
     logger.info(f"[/api/models/check] targets={targets}")
     try:
@@ -209,7 +199,7 @@ def check_updates(req: PathsRequest):
         return {"success": False, "error": str(e), "results": [], "summary": {}}
 
 
-def _check_update_one(rel_path: str) -> Dict:
+def _check_one(rel_path: str) -> Dict:
     """检测单个模型。返回值一定带 status 与 message，前端不会拿到 undefined。"""
     logger.info(f"[/api/models/check-one] {rel_path!r}")
     try:
@@ -230,17 +220,17 @@ def _check_update_one(rel_path: str) -> Dict:
 
 # ⭐ GET 与 POST 都注册。
 #    修复前只有 POST，而前端用的是 GET，结果拿到 405 Method Not Allowed，
-#    响应体里既没有 message 也没有 status，界面就显示成"xxx.gguf：undefined"。
+#    响应体里既没有 message 也没有 status，界面就显示成“xxx.gguf：undefined”。
 @router.get("/check-one")
-def check_update_one_get(rel_path: str = Query(...)):
-    """检测单个模型（GET，供每行的「检测」按钮调用）。"""
-    return _check_update_one(rel_path)
+def check_one_get(rel_path: str = Query(...)):
+    """检测单个模型（GET，供每行的“检测”按钮调用）。"""
+    return _check_one(rel_path)
 
 
 @router.post("/check-one")
-def check_update_one_post(rel_path: str = Query(...)):
+def check_one_post(rel_path: str = Query(...)):
     """检测单个模型（POST，兼容旧调用方）。"""
-    return _check_update_one(rel_path)
+    return _check_one(rel_path)
 
 
 # ------------------------------------------------------------

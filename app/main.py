@@ -1,4 +1,16 @@
-# app/main.py
+"""
+应用入口。
+
+启动顺序：
+  1. 加载配置 → 2. 初始化日志 → 3. 注册路由 → 4. 挂载静态文件 → 5. 启动更新调度器
+
+v1.3.0 主要变化：
+  · 新增 /api/events SSE 端点，状态变化主动推送
+  · 版本号统一来自 app/__init__.py（Web 页脚也读这里）
+  · 调度器改为幂等启动（已运行时不再起新线程）
+"""
+
+import os
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -7,31 +19,37 @@ from fastapi.staticfiles import StaticFiles
 
 from app import __version__
 from app.config import settings, REGISTRY_FILENAME
-from app.logger import setup_logging, get_logger, get_timezone_name
-from app.routers import search, download, manage, logs, tasks, config, llamacpp
-from app.services.updater import scheduler
+from app.logger import (
+    setup_logging, get_logger, get_timezone_name, set_timezone,
+)
+from app.routers import models, downloads, sources, system
+from app.sources.updater import scheduler
+from app.events import emit_scheduler_tick
 
-# 初始化日志（含内存缓冲区）
-setup_logging(settings.log_level, settings.log_buffer_size, settings.timezone)
 logger = get_logger("app.main")
 
-# ⭐ 版本号统一来自 app/__init__.py，Web 页脚也读这里
 app = FastAPI(title="GGUF Model Manager", version=__version__)
 
-app.include_router(search.router)
-app.include_router(download.router)
-app.include_router(manage.router)
-app.include_router(logs.router)
-app.include_router(tasks.router)      # 下载任务状态 / 取消
-app.include_router(config.router)     # 运行时配置（弹窗时长、llama.cpp、更新检测）
-app.include_router(llamacpp.router)   # llama.cpp 重载
+# 路由注册：按职责分组
+app.include_router(models.router)        # /api/models
+app.include_router(downloads.router)     # /api/download, /api/tasks
+app.include_router(sources.router)       # /api/search
+app.include_router(system.router)        # /api/config, /api/logs, /api/llamacpp, /api/events
 
+# 静态文件（前端）
 static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 
 @app.on_event("startup")
-async def on_startup():
+async def on_startup() -> None:
+    # 初始化日志（含内存缓冲区）
+    # ⭐ 时区优先读环境变量 LOG_TZ（Dockerfile/compose 中设置），
+    #    若 Web 面板已写过 timezone 字段到 settings.json，则用面板值。
+    _tz = settings.get("timezone", "") or os.getenv("LOG_TZ", "")
+    if _tz:
+        set_timezone(_tz)
+    setup_logging(settings.log_level, settings.log_buffer_size, _tz)
     logger.info("=" * 62)
     logger.info(f"GGUF Model Manager v{__version__} is starting")
     logger.info(f"  MODEL_DIR        = {settings.MODEL_DIR}")
@@ -40,14 +58,20 @@ async def on_startup():
     logger.info(f"  SEARCH_LIMIT     = {settings.search_limit}")
     logger.info(f"  LOG_LEVEL        = {settings.log_level}")
     logger.info(f"  LOG_BUFFER_SIZE  = {settings.log_buffer_size}")
-    logger.info(f"  TOAST_DURATION   = {settings.toast_duration}s")
-    logger.info(f"  HF TIMEOUT       = {settings.hf_connect_timeout}s / {settings.hf_read_timeout}s "
-                f"(retries={settings.hf_max_retries})")
-    logger.info(f"  LLAMACPP         = enabled={settings.llamacpp_enabled} "
-                f"url={settings.llamacpp_url or '-'} mode={settings.llamacpp_reload_mode} "
-                f"reload_on_download={settings.llamacpp_reload_on_download}")
-    logger.info(f"  UPDATE CHECK     = enabled={settings.update_check_enabled} "
-                f"every {settings.update_check_interval_minutes} min")
+    logger.info(f"  TOAST_DURATION   = {settings.task_panel_autohide}s")
+    logger.info(
+        f"  HF TIMEOUT       = {settings.hf_connect_timeout}s / {settings.hf_read_timeout}s "
+        f"(retries={settings.hf_max_retries})"
+    )
+    logger.info(
+        f"  LLAMACPP         = enabled={settings.llamacpp_enabled} "
+        f"url={settings.llamacpp_url or '-'} mode={settings.llamacpp_reload_mode} "
+        f"reload_on_download={settings.llamacpp_reload_on_download}"
+    )
+    logger.info(
+        f"  UPDATE CHECK     = enabled={settings.update_check_enabled} "
+        f"every {settings.update_check_interval_minutes} min"
+    )
     logger.info(f"  TIMEZONE         = {get_timezone_name()}")
     logger.info("=" * 62)
 
@@ -66,10 +90,11 @@ async def on_startup():
 
     # 启动定期更新检测（开关关闭时内部直接返回）
     scheduler.start()
+    emit_scheduler_tick(scheduler.status())
 
 
 @app.get("/")
-async def index():
+async def index() -> FileResponse:
     return FileResponse(str(static_dir / "index.html"))
 
 

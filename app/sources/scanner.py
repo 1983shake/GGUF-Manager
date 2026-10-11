@@ -1,9 +1,8 @@
-# app/services/local_scanner.py
 """
 本地模型扫描。
 
 除了完整的 .gguf，这里也会扫描下载中断留下的 .gguf.part 缓存文件，
-并给出"有效性"标签，方便在界面上直接清理：
+并给出“有效性”标签，方便在界面上直接清理：
 
   valid       完整 .gguf，且文件头是 GGUF 魔数
   incomplete  .gguf.part —— 下载未完成或被取消的残留
@@ -12,6 +11,9 @@
 
 不扫描 .part 的话，取消或失败的下载会在磁盘上留几十 GB 的垃圾，
 而界面上完全看不到、也删不掉。
+
+v1.3.0：扫描结果会带上注册表里的来源/更新状态，并把 update_info 与
+        last_check_status 一并返回，前端无需再自行拼装。
 """
 
 from pathlib import Path
@@ -19,6 +21,7 @@ from typing import Dict, List, Optional
 
 from app.logger import get_logger
 from app.models import human_size
+from app.sources.registry import registry
 
 logger = get_logger(__name__)
 
@@ -95,6 +98,9 @@ def scan_models(model_dir: str) -> List[Dict]:
         logger.warning(f"[local] scan dir does not exist: {model_dir}")
         return models
 
+    # 扫描时同步把来源信息与更新状态拼上，省去前端二次拼接
+    reg = registry.all()
+
     seen = set()
     for f in sorted(root.rglob("*")):
         if not f.is_file():
@@ -107,13 +113,31 @@ def scan_models(model_dir: str) -> List[Dict]:
         seen.add(str(f))
 
         entry = _entry(f, root)
-        if entry:
-            models.append(entry)
+        if not entry:
+            continue
+
+        if not entry["is_part"]:
+            rel = entry["relative_path"]
+            rec = reg.get(rel)
+            if rec:
+                entry["source"] = rec.get("source", "")
+                entry["model_id"] = rec.get("model_id", "")
+                entry["remote_filename"] = rec.get("filename", "")
+                entry["last_check_status"] = rec.get("last_check_status")
+                entry["last_checked_at"] = rec.get("last_checked_at")
+                entry["has_update_info"] = True
+            else:
+                entry["source"] = ""
+                entry["model_id"] = ""
+                entry["has_update_info"] = False
+
+        models.append(entry)
 
     models.sort(key=lambda x: (x["is_part"], -x["modified"]))
+    incomplete = sum(1 for m in models if m["is_part"])
     logger.info(
         f"[local] scan_models: found {len(models)} files in {model_dir} "
-        f"(incomplete={sum(1 for m in models if m['is_part'])})"
+        f"(incomplete={incomplete})"
     )
     return models
 
@@ -148,12 +172,20 @@ def delete_model(file_path: str, model_dir: str) -> bool:
         target.parent.rmdir()
     except OSError:
         pass
+
+    # 同步清理来源记录，避免留下“幽灵记录”
+    from app.sources.registry import rel_path_of
+    rel = rel_path_of(str(target))
+    if rel:
+        registry.remove(rel)
+
     return True
 
 
 def delete_models(file_paths: List[str], model_dir: str) -> Dict:
     """批量删除，逐个独立处理，单个失败不影响其他。"""
     deleted, failed = [], []
+    rels_to_remove = []
     for p in file_paths or []:
         try:
             if delete_model(p, model_dir):

@@ -1,4 +1,5 @@
 # docker-compose.yml
+# GGUF-Manager v1.3.0
 # 首次启动后 ./config/settings.json 会自动生成，也可直接编辑该文件。
 
 services:
@@ -17,11 +18,10 @@ services:
       # 模型文件（大文件，建议放空间充足的盘）
       - ./models:/app/models
 
-      # ⭐ 配置持久化卷：Web 设置面板的所有改动都存这里，
+      # ⭐ 配置持久化卷：Web 设置面板的所有改动都存这里
       - ./config:/app/config
-
-      # 可选：额外的只读模型目录，在 Web 的"扫描路径"里填 /app/external-models
-      # - /mnt/nas/models:/app/external-models:ro
+      # Docker socket for fallback reload (docker restart)
+      - /var/run/docker.sock:/var/run/docker.sock
 
     environment:
       # 容器内模型目录（改挂载路径时同步调整）
@@ -32,3 +32,6 @@ services:
 
       # 日志时区。容器默认 UTC，这里设成北京时间
       - LOG_TZ=Asia/Shanghai
+
+      # 需要下载 gated 模型时填 Token
+      # - HF_TOKEN=your_token_here

@@ -544,6 +544,7 @@ async function refreshTasks() {
         const tasks = data.tasks || [];
         const prev = window.__lastTasks || [];
         window.__lastTasks = tasks;
+        window.__prevTasks = prev.slice();
 
         // 任务刚结束 → 提示一次
         prev.forEach(old => {
@@ -776,7 +777,7 @@ function taskCardHtml(t) {
         : '';
 
     return `
-        <div class="task-item task-${escapeHtml(t.status)}">
+        <div class="task-item task-${escapeHtml(t.status)}" data-task-id="${escapeHtml(String(t.id))}">
             <div class="task-item-head">
                 <span class="task-name" title="${escapeHtml(t.model_id + '/' + t.filename)}">
                     ${escapeHtml(t.filename)}
@@ -1197,12 +1198,10 @@ document.getElementById('check-all-btn').addEventListener('click', async () => {
             body: JSON.stringify({ rel_paths: [] }),
         });
         const data = await res.json();
-        await loadLocalModels();
+        // v1.3.0：检测完成由事件流（check_completed）推送，这里只需把结果
+        // 灌进缓存即可，无需再整表重扫磁盘。
         (data.results || []).forEach(r => updateStatus.set(r.rel_path, r));
-        // 用上次扫描目录重新渲染，把最新检测结果刷进状态列
-        renderLocalModels(
-            localModels, document.getElementById('local-results'), lastScanDir
-        );
+        refreshLocalBadgesOnly();
         const s = data.summary || {};
         toast(`检测完成：${s.up_to_date || 0} 最新 / ${s.update_available || 0} 有更新 / `
               + `${s.local_mismatch || 0} 不完整 / ${s.check_failed || 0} 失败`, 'success');
@@ -1369,11 +1368,21 @@ document.getElementById('settings-save').addEventListener('click', async () => {
             body: JSON.stringify({ values }),
         });
         const data = await res.json();
+
+        // ⭐ 无论结果如何，先关掉模态框（放在 try 最前面确保执行）
+        closeSettings();
+
+        if (!res.ok || data.success === false) {
+            toast('保存失败: ' + (data.error || JSON.stringify(data.rejected || data)), 'error');
+            return;
+        }
+
         if (data.rejected && Object.keys(data.rejected).length) {
             toast(`部分设置未生效：${Object.keys(data.rejected).join('、')}`, 'warning');
         } else {
-            toast('设置已保存', 'success');
+            toast('设置已保存并已重新加载 ✓', 'success');
         }
+
         // ⭐ 保存后完整重新加载配置并让所有依赖生效：
         //    - 重新拉取配置（页脚版本、级别徽标、扫描路径徽标、消息时长）
         //    - 重画日志（级别/条数变了，视图要跟着变）
@@ -1386,8 +1395,8 @@ document.getElementById('settings-save').addEventListener('click', async () => {
         if (document.getElementById('tab-local').classList.contains('active')) {
             await loadLocalModels();
         }
-        closeSettings();
     } catch (e) {
+        closeSettings();
         toast('保存失败: ' + e.message, 'error');
     }
 });
@@ -1412,19 +1421,31 @@ document.getElementById('settings-reset').addEventListener('click', async () => 
 document.getElementById('llama-refresh').addEventListener('click', async () => {
     const out = document.getElementById('llama-probe-result');
     out.textContent = '正在重新扫描...';
+    out.style.whiteSpace = 'pre-line';
     try {
         const res = await fetch(`${API}/api/llamacpp/refresh`, { method: 'POST' });
         const r = await safeJson(res);
         if (r.__parseError) { out.textContent = '✕ ' + r.error; return; }
         const models = r.models || [];
         renderLlamaModels(models);
-        out.textContent = r.ok
-            ? `已重新扫描，共 ${models.length} 个模型`
-            : `重新扫描失败：${r.error || '未知错误'}`;
-        toast(r.ok ? `已重新扫描，服务端识别到 ${models.length} 个模型` : '重新扫描失败',
-              r.ok ? 'success' : 'error');
+
+        const flav = r.flavor ? ` [${r.flavor}]` : '';
+        if (r.ok) {
+            out.textContent = `已重新扫描${flav}，共 ${models.length} 个模型`;
+            toast(`已重新扫描${flav}，服务端识别到 ${models.length} 个模型`, 'success');
+        } else if (r.hint === 'use_docker_restart') {
+            // 普通 server 的情况：给出明确的 docker restart 指引
+            out.textContent = r.error;
+            out.className = 'probe-result bad';
+            toast('普通 llama-server 不支持刷新，请用 Docker 命令重启', 'warning');
+        } else {
+            out.textContent = `重新扫描失败${flav}：${r.error || '未知错误'}`;
+            out.className = 'probe-result bad';
+            toast(`重新扫描失败${flav}：${r.error || '未知错误'}`, 'error');
+        }
     } catch (e) {
         out.textContent = '重新扫描失败: ' + e.message;
+        out.className = 'probe-result bad';
         toast('重新扫描失败: ' + e.message, 'error');
     }
 });
@@ -1468,26 +1489,199 @@ function renderLlamaModels(models) {
     `;
     box.querySelectorAll('.llama-load-btn').forEach(btn => {
         btn.addEventListener('click', async () => {
-            const name = btn.dataset.model;
+            // ⭐ 关键：直接传模型 id，不要拼路径
+            //   llama.cpp 路由模式要求 model 字段 = GET /models 返回的 data[].id
+            //   它可能是 "Qwen3-48B-Q4_K_M.gguf"、"qwen-coder" 或
+            //   "ggml-org/gemma-3-4b-it-GGUF:Q4_K_M"，拼 .gguf 会破坏 id
+            const modelId = btn.dataset.model;
             btn.disabled = true;
+            const origText = btn.textContent;
+            btn.textContent = '加载中...';
             try {
                 const res = await fetch(`${API}/api/llamacpp/reload`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ model_path: `/${name}.gguf` }),
+                    // model_path 传真实 id；后端 _pick_model_id() 会在 /models 列表里匹配
+                    body: JSON.stringify({ model_path: modelId }),
                 });
-                const r = await res.json();
-                toast(r.ok ? `已请求加载 ${name}` : `加载失败：${r.error || '未知'}`,
-                      r.ok ? 'success' : 'error');
+                const r = await safeJson(res);
+                if (r.__parseError) {
+                    toast('加载失败: ' + r.error, 'error');
+                    return;
+                }
+                if (r.ok) {
+                    toast(`已请求加载 ${modelId}` + (r.no_restart ? '（未重启）' : ''), 'success');
+                    // 刷新状态，显示新加载的模型
+                    setTimeout(() => document.getElementById('llama-status').click(), 800);
+                } else {
+                    toast(`加载失败：${r.error || '未知'}`, 'error');
+                }
             } catch (e) {
                 toast('加载失败: ' + e.message, 'error');
             } finally {
                 btn.disabled = false;
+                btn.textContent = origText;
             }
         });
     });
     box.classList.remove('hidden');
 }
+
+// ⭐ 自动诊断：探测服务端类型并推荐正确配置
+document.getElementById('llama-diagnose').addEventListener('click', async () => {
+    const el = document.getElementById('llama-probe-result');
+    el.textContent = '诊断中...';
+    el.className = 'probe-result';
+    el.style.whiteSpace = 'pre-line';
+    try {
+        // 先探测状态（带 flavor）
+        const res = await fetch(`${API}/api/llamacpp/status`);
+        const d = await safeJson(res);
+        if (d.__parseError) {
+            el.textContent = '✕ ' + d.error;
+            el.className = 'probe-result bad';
+            return;
+        }
+        const p = d.probe || {};
+        const flavor = d.detected_flavor || d.flavor || 'unknown';
+        const base = (d.url || '').replace(/\/$/, '');
+
+        // ⭐ 直接测试路由模式专属端点 /models（官方端点）
+        //   这是分水岭：存在 → router；404 → 不是 router
+        let routerInfo = '';
+        try {
+            const r4 = await fetch(`${API}/api/llamacpp/proxy?path=/models`);
+            const rj4 = await safeJson(r4);
+            if (!rj4.__parseError) {
+                if (rj4.status === 200 || rj4.ok) {
+                    const items = (rj4.data || rj4.body || {}).data || [];
+                    const ids = items.map(it => it.id).filter(Boolean);
+                    routerInfo = `\n✓ 路由端点 /models 可用（发现 ${ids.length} 个模型）`;
+                    if (ids.length) {
+                        routerInfo += `\n  模型 id：${ids.slice(0, 5).join(', ')}${ids.length > 5 ? '...' : ''}`;
+                    }
+                } else {
+                    routerInfo = `\nℹ 路由端点 /models 返回 ${rj4.status || '?'}，可能不是路由模式`;
+                }
+            }
+        } catch (e) {
+            routerInfo = `\nℹ 无法验证 /models 端点（${e.message}）`;
+        }
+
+        // 再试重载（用默认端点）
+        let reloadInfo = '';
+        let reloadResult = null;
+        try {
+            const r2 = await fetch(`${API}/api/llamacpp/reload`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model_path: null }),
+            });
+            reloadResult = await safeJson(r2);
+            if (!reloadResult.__parseError) {
+                if (reloadResult.ok) {
+                    reloadInfo = `\n✓ 重载成功（端点：${reloadResult.endpoint}，未重启容器）`;
+                    if (reloadResult.model_id) {
+                        reloadInfo += `\n  加载的模型：${reloadResult.model_id}`;
+                    }
+                } else if (reloadResult.fallback) {
+                    reloadInfo = `\n✓ HTTP 失败，已自动用 Docker 命令重载成功`;
+                } else {
+                    reloadInfo = `\n✕ 重载失败：${reloadResult.error || '未知'}`;
+                    // 显示已尝试的端点
+                    if (reloadResult.tried && reloadResult.tried.length) {
+                        reloadInfo += `\n  已尝试：${reloadResult.tried.join(', ')}`;
+                    }
+                }
+            }
+        } catch (e) {
+            reloadInfo = `\n✕ 重载测试异常：${e.message}`;
+        }
+
+        // 再试刷新（官方方式：GET /models?reload=1）
+        let refreshInfo = '';
+        try {
+            const r3 = await fetch(`${API}/api/llamacpp/refresh`, { method: 'POST' });
+            const rj3 = await safeJson(r3);
+            if (!rj3.__parseError) {
+                if (rj3.ok) {
+                    refreshInfo = `\n✓ 刷新成功（端点：${rj3.endpoint}，发现 ${rj3.models_count || 0} 个模型）`;
+                } else if (rj3.hint === 'use_docker_restart') {
+                    refreshInfo = '\nℹ 普通 server 不支持刷新（正常，用 Docker 重启即可）';
+                } else {
+                    refreshInfo = `\n✕ 刷新失败：${rj3.error || ''}`;
+                }
+            }
+        } catch (e) {
+            refreshInfo = `\n✕ 刷新测试异常：${e.message}`;
+        }
+
+        // ⭐ 针对性建议
+        let suggestion = '';
+        if (flavor === 'server' && (!reloadResult || !reloadResult.ok)) {
+            suggestion = [
+                '\n',
+                '═══════════════════════════════════════════════════════',
+                '💡 当前是普通 llama-server（单模型模式）',
+                '═══════════════════════════════════════════════════════',
+                '  普通 server 的 HTTP 热重载端点 /update 在默认 Docker 镜像中',
+                '  通常未编译，因此重载只能用 Docker 命令：',
+                '    设置 → 重载方式 → Shell 命令',
+                '    命令：docker restart llama-cpp-server',
+                '',
+                '  若想「不重启切换模型」，需改为路由模式：',
+                '    1. 在 docker-compose.yml 中【移除】LLAMA_ARG_MODEL（-m）',
+                '    2. 保留 LLAMA_ARG_MODELS_DIR=/models',
+                '    3. 保留 LLAMA_ARG_MODELS_MAX=1（同时只加载 1 个）',
+                '    4. docker compose up -d 重建',
+                '    5. 回来把「服务端类型」改为「路由模式」',
+                '═══════════════════════════════════════════════════════',
+            ].join('\n');
+        } else if (flavor === 'router' && reloadResult && !reloadResult.ok) {
+            suggestion = [
+                '\n',
+                '═══════════════════════════════════════════════════════',
+                '💡 路由模式重载失败，手动验证步骤：',
+                '═══════════════════════════════════════════════════════',
+                `  # 1. 看路由端点是否存在 + 模型列表`,
+                `  curl '${base}/models'`,
+                `  # 2. 先刷新模型源（让服务端重新扫描磁盘）`,
+                `  curl '${base}/models?reload=1'`,
+                `  # 3. 用第 1 步返回的 id 加载模型（⚠️ 不是文件名）`,
+                `  curl -X POST '${base}/models/load' \\`,
+                `       -H 'Content-Type: application/json' \\`,
+                `       -d '{"model":"<第1步返回的 id>"}'`,
+                '═══════════════════════════════════════════════════════',
+            ].join('\n');
+        }
+
+        const report = [
+            `服务端类型：${flavor}${d.flavor_match === false ? ' ⚠ 与配置不符' : ''}`,
+            `连接状态：${p.reachable ? '✓ 可达' : '✕ 不可达'}`,
+            p.endpoint ? `探测端点：${p.endpoint}` : '',
+            routerInfo,
+            reloadInfo,
+            refreshInfo,
+            suggestion,
+        ].filter(Boolean).join('\n');
+
+        el.textContent = report;
+        el.className = 'probe-result ' + (p.reachable ? 'ok' : 'bad');
+
+        if (flavor === 'router' && reloadResult && reloadResult.ok) {
+            toast('诊断完成：路由模式正常，重载成功（未重启）', 'success');
+        } else if (flavor === 'server' && reloadResult && reloadResult.ok) {
+            toast('诊断完成：服务端正常，重载端点可用', 'success');
+        } else if (flavor === 'server') {
+            toast('诊断完成：建议使用 Docker 命令方式重载', 'warning');
+        } else {
+            toast('诊断完成，请查看详情', 'warning');
+        }
+    } catch (e) {
+        el.textContent = '✕ ' + e.message;
+        el.className = 'probe-result bad';
+    }
+});
 
 document.getElementById('llama-probe').addEventListener('click', async () => {
     const el = document.getElementById('llama-probe-result');
@@ -1515,6 +1709,7 @@ document.getElementById('llama-reload').addEventListener('click', async () => {
     const el = document.getElementById('llama-probe-result');
     el.textContent = '重载中...';
     el.className = 'probe-result';
+    el.style.whiteSpace = 'pre-line';
     try {
         const res = await fetch(`${API}/api/llamacpp/reload`, {
             method: 'POST',
@@ -1527,14 +1722,49 @@ document.getElementById('llama-reload').addEventListener('click', async () => {
             el.className = 'probe-result bad';
             return;
         }
+
+        const ep = r.endpoint ? ` (${r.endpoint})` : '';
+        const flav = r.flavor ? ` [${r.flavor}]` : '';
+        const method = r.method || 'http';
+
         if (r.ok) {
-            el.textContent = '✓ 已重载';
-            el.className = 'probe-result ok';
-            toast('llama.cpp 已重新加载', 'success');
-        } else {
-            el.textContent = '✕ ' + (r.reason || r.error || '失败');
+            if (r.no_restart) {
+                // 路由模式热切换：未重启容器
+                let msg = `✓ 模型已热切换（未重启服务）${ep}${flav}`;
+                if (r.model_id) {
+                    msg += `\n  模型：${r.model_id}`;
+                }
+                el.textContent = msg;
+                el.className = 'probe-result ok';
+                toast(`模型已热切换：${r.model_id || '默认'}，无需重启`, 'success');
+            } else if (r.fallback) {
+                // HTTP 失败，用了 docker 命令
+                el.textContent = `✓ 重载成功（HTTP 失败，已自动用 Docker 命令重启）\n命令：${r.command || ''}`;
+                el.className = 'probe-result ok';
+                toast('llama.cpp 已通过 Docker 命令重启', 'success');
+            } else if (method === 'command') {
+                el.textContent = `✓ 重载成功（Shell 命令）\n命令：${r.command || ''}`;
+                el.className = 'probe-result ok';
+                toast('llama.cpp 已通过命令重载', 'success');
+            } else {
+                el.textContent = '✓ 已重载' + ep + flav;
+                el.className = 'probe-result ok';
+                toast('llama.cpp 已重新加载' + ep, 'success');
+            }
+            // ⭐ 重载成功后自动刷新模型列表
+            setTimeout(() => {
+                document.getElementById('llama-models').click();
+            }, 1500);
+        } else if (r.hint === 'configure_docker_cmd') {
+            // 未配置 docker 命令
+            el.textContent = r.error || '请配置 Docker 重载命令';
             el.className = 'probe-result bad';
-            toast('重载失败：' + (r.reason || r.error || '未知'), 'error');
+            toast('请先在设置中配置 Docker 重载命令', 'warning');
+        } else {
+            const detail = r.error || r.reason || '未知错误';
+            el.textContent = '✕ ' + detail;
+            el.className = 'probe-result bad';
+            toast(`重载失败${flav}：${r.error || r.endpoint || '未知'}`, 'error');
         }
     } catch (e) {
         el.textContent = '✕ ' + e.message;
@@ -1885,9 +2115,247 @@ function debounce(fn, wait) {
 }
 
 // ============================================================
+// 状态事件流（v1.3.0）
+// ============================================================
+/**
+ * 用 SSE（EventSource）订阅后端 /api/events，把“状态变化”从
+ * “手动检测 + 定时轮询”改成“被动接收”。
+ *
+ * 这直接修掉了“更新状态没有及时更新，需要手动检测”的问题：
+ *   · 下载完成      → registry 写入 → model_updated → 自动刷新对应行
+ *   · 更新检测完成   → check_completed → 徽标全部刷新 + 调度器徽标更新
+ *   · 任务状态变化   → task_updated → 任务行实时更新（替代 800ms 轮询）
+ *   · 配置变更       → config_changed → 徽标 / 扫描路径等重新拉取
+ *   · 定期检测启停   → scheduler_tick → 徽标更新
+ *
+ * EventSource 会自动重连；断线期间错过的事件在重连时通过
+ * Last-Event-ID 请求头补回放（后端按 id 回放）。
+ */
+const eventState = {
+    source: null,
+    lastEventId: 0,
+    connected: false,
+};
+
+function startEventStream() {
+    if (eventState.source) return;          // 已连接，不重复起
+    if (!window.EventSource) return;        // 极老浏览器兜底（几乎不会走到）
+
+    const url = `${API}/api/events`;
+    const es = new EventSource(url);
+    eventState.source = es;
+
+    es.onopen = () => {
+        eventState.connected = true;
+        // 重连成功：把可能错过的模型状态整体刷新一次
+        if (eventState.lastEventId > 0 && isLocalTabVisible()) {
+            refreshLocalStatusQuietly();
+        }
+    };
+
+    es.onerror = () => {
+        eventState.connected = false;
+        // EventSource 会自动重试，这里不用自己重建
+    };
+
+    // ---- 通用事件分发 ----
+    es.onmessage = (ev) => {
+        eventState.lastEventId = parseEventId(ev);
+    };
+
+    es.addEventListener('model_updated', (ev) => {
+        const d = safeEventData(ev);
+        eventState.lastEventId = parseEventId(ev);
+        if (!d || !isLocalTabVisible()) return;
+        applyModelUpdated(d);
+    });
+
+    es.addEventListener('check_completed', (ev) => {
+        const d = safeEventData(ev);
+        eventState.lastEventId = parseEventId(ev);
+        if (!isLocalTabVisible()) return;
+        applyCheckCompleted(d);
+    });
+
+    es.addEventListener('task_updated', (ev) => {
+        const d = safeEventData(ev);
+        eventState.lastEventId = parseEventId(ev);
+        applyTaskUpdated(d && d.task);
+    });
+
+    es.addEventListener('config_changed', () => {
+        eventState.lastEventId = parseEventId(ev);
+        loadConfig();                      // 重新拉配置，徽标/路径等跟着变
+    });
+
+    es.addEventListener('scheduler_tick', (ev) => {
+        const d = safeEventData(ev);
+        eventState.lastEventId = parseEventId(ev);
+        if (d) renderScheduleBadge(d);
+    });
+}
+
+function parseEventId(ev) {
+    const id = parseInt(ev.lastEventId || '0', 10);
+    return isNaN(id) ? eventState.lastEventId : Math.max(eventState.lastEventId, id);
+}
+
+function safeEventData(ev) {
+    try { return ev.data ? JSON.parse(ev.data) : null; }
+    catch (e) { return null; }
+}
+
+function isLocalTabVisible() {
+    const t = document.getElementById('tab-local');
+    return !!(t && t.classList.contains('active'));
+}
+
+// ---- 事件处理：精准刷新，避免整表重扫 ----
+function applyModelUpdated(d) {
+    const rel = d && d.rel_path;
+    if (!rel) return;
+
+    // 1) 更新前端缓存的状态，保证下次渲染能拿到
+    if (d.status) {
+        updateStatus.set(rel, { status: d.status, message: '', rel_path: rel });
+    }
+
+    // 2) 若当前列表里就有这一行，只刷新它的状态单元格 + 来源单元格
+    const cell = document.querySelector(
+        `#local-results .status-cell[data-rel="${cssEscape(rel)}"]`
+    );
+    const row = cell && cell.closest('tr');
+    if (row) {
+        // 找模型对象：优先用现有数据，缺则按当前列表匹配
+        const m = findLocalModelByRel(rel);
+        if (m) {
+            // 同步最新状态到行内数据
+            if (d.reason === 'remove') {
+                m.has_update_info = false;
+            } else if (d.status) {
+                m.last_check_status = d.status;
+            }
+            cell.innerHTML = statusCellHtml(m);
+        }
+        return;
+    }
+
+    // 3) 行不在当前 DOM（如整表重渲过、或第一次进来），做一次静默整表刷新
+    refreshLocalStatusQuietly();
+}
+
+function applyTaskUpdated(task) {
+    if (!task) return;
+
+    // 确保任务面板可见（有下载任务就该显示）
+    showTaskPanel();
+
+    const list = document.getElementById('task-list');
+    if (!list) return;
+
+    // 从缓存的 lastTasks 里更新或插入这条任务
+    const tasks = window.__lastTasks || [];
+    const idx = tasks.findIndex(t => t.id === task.id);
+    if (idx >= 0) {
+        tasks[idx] = task;
+    } else {
+        tasks.push(task);
+    }
+    window.__lastTasks = tasks;
+
+    // 如果这条任务刚结束，弹一条通知
+    const prev = window.__prevTasks || [];
+    window.__prevTasks = tasks.slice();
+    const oldOne = prev.find(t => t.id === task.id);
+    if (oldOne && (oldOne.status === 'pending' || oldOne.status === 'downloading')) {
+        if (task.status === 'completed') {
+            toast(`下载完成：${task.filename}`, 'success');
+            if (document.getElementById('tab-local').classList.contains('active')) {
+                loadLocalModels();
+            }
+        } else if (task.status === 'error') {
+            toast(`下载失败：${task.filename}（${task.error || '未知错误'}）`, 'error');
+        } else if (task.status === 'cancelled') {
+            toast(`已取消：${task.filename}`, 'info');
+        }
+    }
+
+    // 精准更新：只重绘这条任务的卡片，不整表重渲
+    const existing = list.querySelector(`.task-item[data-task-id="${cssEscape(String(task.id))}"]`);
+    if (existing) {
+        // 用新的 HTML 替换，但保留事件委托（按钮用事件委托处理）
+        const wrapper = document.createElement('div');
+        wrapper.innerHTML = taskCardHtml(task).trim();
+        const newEl = wrapper.firstChild;
+        newEl.dataset.taskId = String(task.id);
+        existing.replaceWith(newEl);
+    } else {
+        // 新任务：直接插到列表头部
+        const wrapper = document.createElement('div');
+        wrapper.innerHTML = taskCardHtml(task).trim();
+        const newEl = wrapper.firstChild;
+        newEl.dataset.taskId = String(task.id);
+        list.insertBefore(newEl, list.firstChild);
+    }
+
+    lastTaskSnapshot = ''; // 强制下次轮询重绘时重新渲染
+    renderNetSpeed(
+        tasks.filter(t => t.status === 'downloading').reduce((s, t) => s + (t.speed_bps || 0), 0),
+        tasks.filter(t => t.status === 'pending' || t.status === 'downloading').length
+    );
+    updatePanelVisibility();
+}
+
+function applyCheckCompleted(d) {
+    // 把这一轮的逐条结果灌进缓存，再整表刷新徽标
+    (d && d.results || []).forEach(r => {
+        if (r && r.rel_path) {
+            updateStatus.set(r.rel_path, r);
+        }
+    });
+    const rows = document.querySelectorAll('#local-results tbody tr[data-rel]');
+    if (rows.length) {
+        refreshLocalBadgesOnly();           // 只刷徽标，不重新扫描磁盘
+    } else {
+        refreshLocalStatusQuietly();
+    }
+    renderScheduleBadge();                  // 调度器徽标同步更新
+}
+
+/** 只重绘状态单元格，不动磁盘扫描 —— 最快的刷新路径。 */
+function refreshLocalBadgesOnly() {
+    document.querySelectorAll('#local-results tbody tr[data-rel]').forEach(row => {
+        const rel = row.dataset.rel;
+        const m = findLocalModelByRel(rel);
+        if (!m) return;
+        const cell = row.querySelector('.status-cell');
+        if (cell) cell.innerHTML = statusCellHtml(m);
+    });
+}
+
+/** 静默重扫：更新 localModels 与徽标，不打扰用户（不清空选择、不弹提示）。 */
+async function refreshLocalStatusQuietly() {
+    const path = ((APP_CONFIG.values && APP_CONFIG.values.scan_path) || '').trim();
+    try {
+        const res = await fetch(`${API}/api/models?path=${encodeURIComponent(path)}`);
+        const data = await res.json();
+        if (data && data.models) {
+            localModels = data.models;
+            lastScanDir = data.scan_dir || lastScanDir;
+            refreshLocalBadgesOnly();
+        }
+    } catch (e) { /* 静默：这是后台补偿刷新，失败不影响用户 */ }
+}
+
+function findLocalModelByRel(rel) {
+    return (localModels || []).find(m => m.relative_path === rel);
+}
+
+// ============================================================
 // 启动
 // ============================================================
 (async function boot() {
     await loadConfig();          // 先拿配置（弹窗时长、版本、定期检测状态）
     refreshTasks();              // 恢复可能存在的下载任务面板
+    startEventStream();          // v1.3.0：开启状态事件流
 })();

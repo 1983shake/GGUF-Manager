@@ -1,11 +1,12 @@
 # GGUF-Manager
 
-基于 Docker 的 GGUF 模型管理器：搜索 HuggingFace / ModelScope 上的 GGUF 模型，在线下载、本地管理、检测更新，并可在下载完成后让 llama.cpp 自动切换模型。
+基于 Docker 的 GGUF 模型管理器：搜索 HuggingFace / ModelScope 上的 GGUF 模型，在线下载、本地管理、检测更新，并在下载完成后让 llama.cpp **无需重启容器即可热切换模型**。
 
 - **搜索**：关键词模糊搜索，结果带文件大小与 GGUF 文件数
 - **下载**：流式下载，含实时进度、速度、剩余时间，可随时取消并支持断点续传
 - **管理**：本地模型列表、有效性校验、缓存清理、单模型 / 批量更新检测
 - **集成**：对接 llama.cpp 路由模式与 llama-swap，新增 / 删除模型后自动同步
+- **实时推送**：基于 SSE 的事件驱动架构，下载完成 / 检测结束 / 配置变更无需手动刷新
 
 ---
 
@@ -48,6 +49,9 @@ services:
       # ⭐ 配置持久化卷：Web 设置面板的所有改动都存这里，
       - ./config:/app/config
 
+      # Docker socket：用于"重载方式 = Shell 命令"时执行 docker restart
+      - /var/run/docker.sock:/var/run/docker.sock
+
       # 可选：额外的只读模型目录，在 Web 的"扫描路径"里填 /app/external-models
       # - /mnt/nas/models:/app/external-models:ro
 
@@ -83,9 +87,9 @@ docker compose pull && docker compose up -d  # 拉取新镜像并更新
 
 启动后自动生成两个目录，**请勿删除**：
 
-| 目录 | 用途 |
-|---|---|
-| `./models` | 模型文件 |
+| 目录       | 用途                                                     |
+| ---------- | -------------------------------------------------------- |
+| `./models` | 模型文件                                                 |
 | `./config` | 配置与来源注册表（**必须挂载，否则重建容器后设置会丢**） |
 
 #### 关键配置说明
@@ -94,10 +98,11 @@ docker compose pull && docker compose up -d  # 拉取新镜像并更新
 
 ```yaml
 ports:
-  - "8200:8200"          # 宿主:容器
+  - "8200:8200" # 宿主:容器
 volumes:
   - ./models:/app/models
   - ./config:/app/config
+  - /var/run/docker.sock:/var/run/docker.sock # 用 Docker 命令重载时必填
 environment:
   - MODEL_DIR=/app/models
   - CONFIG_DIR=/app/config
@@ -124,6 +129,7 @@ docker run -d --name gguf-manager --restart unless-stopped \
   -p 8200:8200 \
   -v ./models:/app/models \
   -v ./config:/app/config \
+  -v /var/run/docker.sock:/var/run/docker.sock \
   -e MODEL_DIR=/app/models \
   -e CONFIG_DIR=/app/config \
   -e LOG_TZ=Asia/Shanghai \
@@ -149,6 +155,7 @@ docker run -d --name gguf-manager --restart unless-stopped \
   -p 8200:8200 \
   -v ./models:/app/models \
   -v ./config:/app/config \
+  -v /var/run/docker.sock:/var/run/docker.sock \
   -e MODEL_DIR=/app/models \
   -e CONFIG_DIR=/app/config \
   -e LOG_TZ=Asia/Shanghai \
@@ -200,31 +207,174 @@ uvicorn app.main:app --host 0.0.0.0 --port 8200 --reload
 
 ### 设置面板
 
-| 分组 | 说明 |
-|---|---|
+| 分组         | 说明                                                   |
+| ------------ | ------------------------------------------------------ |
 | 数据源与日志 | HuggingFace 镜像、日志级别、日志保留条数、模型扫描路径 |
-| 任务面板 | 面板与通知的展示时长（默认 3 秒） |
-| 网络 | 连接 / 读取超时、重试次数、搜索总时限 |
-| llama.cpp | 服务地址、服务端类型、下载完成后自动重载 |
-| 更新检测 | 定期检测开关与间隔 |
+| 任务面板     | 面板与通知的展示时长（默认 3 秒）                      |
+| 网络         | 连接 / 读取超时、重试次数、搜索总时限                  |
+| llama.cpp    | 服务地址、服务端类型、下载完成后自动重载               |
+| 更新检测     | 定期检测开关与间隔                                     |
 
 设置保存后立即生效，无需重启容器。
 
-### llama.cpp 集成
+---
 
-支持三种服务端形态：
+## 三、llama.cpp 集成（重点）
 
-| 类型 | 说明 |
-|---|---|
-| llama.cpp 路由模式 | 支持模型列表、加载 / 卸载、重新扫描模型源 |
-| llama-swap | 通过 `/v1/models` 管理，加载由推理请求自动触发 |
-| 普通 llama-server | 单模型，可用 HTTP 请求或自定义命令重载 |
+### 3.1 三种服务端形态
 
-在设置页点「测试连接」确认连通，再点「模型列表」核对服务端识别到的模型。建议把「服务端类型」从自动探测改为显式指定，省掉每次探测。
+| 类型                   | 说明                                                | 支持热切换        |
+| ---------------------- | --------------------------------------------------- | ----------------- |
+| **llama.cpp 路由模式** | 官方 router 模式，支持模型列表、加载/卸载、重新扫描 | ✅ 无需重启       |
+| **llama-swap**         | 通过 `/v1/models` 管理，加载由推理请求自动触发      | ✅ 无需重启       |
+| 普通 llama-server      | 单模型，可用 HTTP `/update` 或自定义命令重载        | ⚠️ 通常需重启容器 |
+
+**强烈推荐使用路由模式**。
+
+### 3.2 服务端配置（docker-compose.yml）
+
+路由模式的关键是**不指定 `-m / LLAMA_ARG_MODEL`**，改为用 `LLAMA_ARG_MODELS_DIR` 指定模型目录：
+
+```yaml
+services:
+  llama-cpp-server:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: llama-cpp-server
+    restart: always
+    ports:
+      - "8085:8080"
+    volumes:
+      # ⭐ 与 GGUF-Manager 挂载同一个模型目录（路径可以不同，但要指向同一份文件）
+      - /vol2/1000/docker_cache/llama-cpp_models:/models
+      - /vol2/1000/docker_cache/llama-cpp_cache:/root/.cache
+    environment:
+      - TZ=Asia/Shanghai
+      - LLAMA_ARG_HOST=0.0.0.0
+      - LLAMA_ARG_PORT=8080
+      - LLAMA_ARG_THREADS=3.5
+      - LLAMA_ARG_BATCH=512
+      - LLAMA_ARG_CTX_SIZE=65536
+      - LLAMA_ARG_N_GPU_LAYERS=0
+
+      # ⭐⭐⭐ 路由模式三件套（缺一不可）
+      - LLAMA_ARG_MODELS_DIR=/models # 扫描模型目录
+      - LLAMA_ARG_MODELS_MAX=1 # 同时只加载 1 个模型
+      - LLAMA_ARG_MODELS_AUTOLOAD=true # 首次请求时自动加载
+
+
+      # ⚠️ 千万不要设置 LLAMA_ARG_MODEL / -m，否则退化为单模型模式，
+      #    路由端点 /models/load 会直接返回 404
+```
+
+### 3.3 GGUF-Manager 端设置
+
+打开 **设置 → llama.cpp**：
+
+| 配置项                     | 推荐值                                                |
+| -------------------------- | ----------------------------------------------------- |
+| 启用 llama.cpp 集成        | ✅ 勾选                                               |
+| 服务端类型                 | `llama.cpp 路由模式`（若不确定先选"自动探测"）        |
+| 服务地址                   | `http://192.168.1.100:8080`（改为你的服务端 IP:端口） |
+| 模型下载完成后自动重新加载 | ✅ 勾选                                               |
+| 重载方式                   | `HTTP 请求`                                           |
+
+保存后，点 **「测试连接」** 应显示 `✓ 在线（/models）`，点 **「模型列表」** 应能看到服务端已识别的所有 `.gguf` 文件名。
+
+### 3.4 热切换工作原理（v1.3.0 关键修复）
+
+llama.cpp 路由模式有一个**关键行为**：
+
+> **只在启动时扫描一次 `LLAMA_ARG_MODELS_DIR` 目录，运行期间不监听磁盘变化。**
+
+这意味着新下载的模型文件虽然已经写到磁盘，但**服务端内存里没有它的记录**，直接 `POST /models/load` 会返回：
+
+```json
+{
+  "error": {
+    "message": "File Not Found",
+    "type": "not_found_error",
+    "code": 404
+  }
+}
+```
+
+**正确流程**（GGUF-Manager v1.3.0 已自动化）：
+
+```
+下载完成 → 写入 /models/xxx.gguf
+   ↓
+① GET  /models?reload=1        ← ⭐ 让服务端重新扫描磁盘（必做！）
+   ↓
+② POST /models/load {"model":"xxx.gguf"}   ← 加载新模型，不重启容器
+   ↓
+服务端自动卸载旧模型 → 加载新模型 → 秒级完成
+```
+
+日志中会看到：
+
+```
+[llamacpp] router flavor detected, pre-refresh via GET /models?reload=1 before load
+[llamacpp] pre-refresh result: ok=True, models_count=4    ← 服务端识别到 4 个模型
+[llamacpp] POST .../models/load payload={'model': 'qwen2.5-coder-7b-instruct-q4_k_m.gguf'}
+[llamacpp] reload OK: /models/load id=qwen2.5-coder-7b-instruct-q4_k_m.gguf
+```
+
+### 3.5 手动诊断（可选）
+
+遇到问题时，可在命令行手动验证全链路：
+
+```bash
+# ① 让服务端重新扫描磁盘，观察模型数量变化
+curl 'http://192.168.1.100:8080/models?reload=1' | jq '.data | length'
+
+# ② 查看服务端当前识别到的所有模型 id
+curl 'http://192.168.1.100:8080/models' | jq '.data[].id'
+
+# ③ 手动加载某个模型（id 用上一步返回的）
+curl -X POST 'http://192.168.1.100:8080/models/load' \
+     -H 'Content-Type: application/json' \
+     -d '{"model":"qwen2.5-coder-7b-instruct-q4_k_m.gguf"}'
+
+# ④ 看服务端日志确认加载成功
+docker logs --tail 30 llama-cpp-server
+```
+
+只要 ① 能返回新的模型 id，说明磁盘和扫描都正常；③ 成功则说明热切换链路完全打通。
+
+### 3.6 常见问题
+
+#### Q: 点「立即重载」报 404 File Not Found？
+
+- 检查服务端是否真的运行在路由模式：`curl http://<服务端>/models` 应返回 `{"data":[...]}` 结构
+- 检查服务端 docker-compose 是否**误设置了** `LLAMA_ARG_MODEL`（应删除）
+- 检查 GGUF-Manager 和 llama.cpp **是否挂载了同一个模型目录**（宿主机上应该是同一份文件）
+
+#### Q: 报 400 `model is already running`？
+
+这是**幂等成功**——目标模型已经在运行，无需重复加载。v1.3.0 会自动识别并提示成功。
+
+#### Q: 报 500 `model limit reached`？
+
+服务端已加载的模型数达到 `LLAMA_ARG_MODELS_MAX`。v1.3.0 会自动尝试「先 unload 再 load」兜底。或改用：
+
+- 方式 A：卸载其他模型后再试
+- 方式 B：把 `LLAMA_ARG_MODELS_MAX` 调大
+
+#### Q: 普通 llama-server（用 `-m` 启动）怎么办？
+
+普通 server 的 `/update` 端点**不是所有编译版本都有**，Docker 默认镜像经常不带。此时唯一可靠的方式是重启容器：
+
+1. GGUF-Manager 设置 → 「重载方式」改为 **`Shell 命令`**
+2. 命令填：`docker restart llama-cpp-server`
+3. 确保 GGUF-Manager 容器挂载了 `/var/run/docker.sock`
+
+#### Q: 服务端容器名不叫 `llama-cpp-server`？
+
+改命令里的容器名即可。`docker ps --format '{{.Names}}'` 可以查看实际名字。
 
 ---
 
-## 三、注意事项
+## 四、注意事项
 
 1. **配置必须挂载**：`./config` 不挂卷时容器重建会丢失全部设置。启动日志会检测并提示是否挂载成功。
 2. **国内网络务必配置镜像**：容器内通常无法直连 `huggingface.co`，请在「设置 / 数据源与日志 / HuggingFace 镜像」填 `https://hf-mirror.com`。
@@ -232,11 +382,40 @@ uvicorn app.main:app --host 0.0.0.0 --port 8200 --reload
 4. **取消下载会保留 `.part` 文件**：这是为断点续传设计的，重新下载同一文件会自动从断点继续；不再需要时用「清理缓存」删除。
 5. **任务列表存于内存**：容器重启后列表清空，但磁盘上的 `.part` 仍在，重新下载会自动续传。
 6. **更新采用原子替换**：下载写入临时文件后整体替换，过程中旧模型保持可用，失败也不会损坏现有文件。
-7. **llama.cpp 需能访问模型路径**：若 llama.cpp 在另一个容器中，需将其模型目录挂载到同一份文件，或在设置里配置「模型名前缀」使其匹配服务端的模型名。
+7. **llama.cpp 必须挂载同一份模型文件**：GGUF-Manager 和 llama.cpp 是两个独立容器，各自挂载的 `/models` 必须**指向宿主机上的同一个目录**。否则 GGUF-Manager 下载完，llama.cpp 的目录里根本没有这个文件。
+8. **路由模式必须移除 `-m / LLAMA_ARG_MODEL`**：只要设置了这个变量，llama.cpp 就会退化为单模型模式，`/models/load` 返回 404。
 
 ---
 
-## 四、许可
+## 五、v1.3.0 更新日志
+
+### 核心变更
+
+- **事件驱动架构**：引入 SSE 事件总线，状态变化主动推送到前端，彻底解决"更新状态不及时刷新"问题
+- **实时状态同步**：下载完成、检测结束、配置变更等操作完成后自动刷新界面，无需手动检测
+- **代码优化**：从 19 个 Python 文件重构为更清晰的模块化架构（routers + sources 分层）
+- **合并冗余路由**：将 download.py + tasks.py 合并为 downloads.py，config.py + logs.py + llamacpp.py 合并为 system.py
+
+### llama.cpp 集成改进
+
+- ⭐ **路由模式热切换修复**：新增 `GET /models?reload=1` 前置刷新步骤，彻底解决"新下载的模型无法被服务端识别"问题
+- ⭐ **候选 id 多形式尝试**：自动尝试带/不带 `.gguf` 后缀、大小写归一、模糊匹配等多种 id 形式
+- ⭐ **400 / 500 智能处理**：`model is already running` 视为幂等成功；500 时自动尝试 unload + load 兜底
+- ⭐ **响应体完整记录**：失败时把每次请求的完整响应体返回给前端，便于排查
+
+### 事件类型
+
+| 事件名            | 触发时机                      |
+| ----------------- | ----------------------------- |
+| `model_updated`   | 模型记录（来源/更新状态）变化 |
+| `check_completed` | 一轮更新检测结束              |
+| `task_updated`    | 下载任务状态变化              |
+| `config_changed`  | 运行时配置被修改              |
+| `scheduler_tick`  | 定期检测调度器状态变化        |
+
+---
+
+## 六、许可
 
 本项目基于 **GNU General Public License v3.0（GPL-3.0）** 开源。
 
@@ -248,7 +427,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8200 --reload
 
 ---
 
-## 五、致谢
+## 七、致谢
 
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) —— GGUF 格式与推理服务
 - [HuggingFace Hub](https://huggingface.co) 与 [ModelScope](https://modelscope.cn) —— 模型来源

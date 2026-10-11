@@ -1,8 +1,7 @@
-# app/services/registry.py
 """
 本地模型来源注册表。
 
-问题：本地只有一堆 .gguf 文件，没有任何"这个模型是从哪个仓库下的"的信息，
+问题：本地只有一堆 .gguf 文件，没有任何“这个模型是从哪个仓库下的”的信息，
       因此无法判断远端是否有更新。
 
 方案：下载完成时记录元数据到配置目录下的 registry.json（默认 /app/config，
@@ -10,12 +9,14 @@
       内容包含来源仓库、远端文件、下载时的远端大小。检测更新时重新查远端
       大小做对比。
 
-没有记录的模型（用户手动拷进去的）标记为"未知来源"，不支持更新检测，
-界面上明确区分，而不是假装"已是最新"。
+没有记录的模型（用户手动拷进去的）标记为“未知来源”，不支持更新检测，
+界面上明确区分，而不是假装“已是最新”。
+
+v1.3.0 变化：写入/状态变更时通过事件总线广播，前端据此自动刷新对应行，
+           不再需要手动点“检测”。
 """
 
 import json
-
 import threading
 import time
 from pathlib import Path
@@ -23,21 +24,20 @@ from typing import Dict, List, Optional
 
 from app.config import settings, resolve_config_dir, REGISTRY_FILENAME
 from app.logger import get_logger
+from app.events import emit_model_updated
 
 logger = get_logger(__name__)
-
-_FILENAME = REGISTRY_FILENAME
 
 
 def _store_path() -> Path:
     # 与 settings.json 同目录，保证两者一起被持久化
     d = resolve_config_dir(Path(settings.MODEL_DIR))
     d.mkdir(parents=True, exist_ok=True)
-    return d / _FILENAME
+    return d / REGISTRY_FILENAME
 
 
 class Registry:
-    """线程安全的 JSON 文件注册表，写操作带节流合并的简化实现（直接落盘）。"""
+    """线程安全的 JSON 文件注册表。"""
 
     def __init__(self):
         self._lock = threading.RLock()
@@ -97,10 +97,9 @@ class Registry:
         """
         记录来源。
 
-        just_downloaded=True（默认）表示这次是刚下载/更新完成的：
-        ⭐ 内容此刻正是远端的最新版本，所以直接标记为「已是最新」，
-           而不是留空让界面显示"未检查"——用户还得手动点一次检测才变绿，
-           这个体验很别扭。远端是否真有更新交给后续检测去判断。
+        just_downloaded=True（默认）表示刚下载/更新完成：
+        ⭐ 内容此刻正是远端最新版本，直接标记为「已是最新」，
+           而不是留空让界面显示“未检查”——用户还得手动点一次检测才变绿。
         """
         self._ensure_loaded()
         now = time.time()
@@ -118,14 +117,20 @@ class Registry:
                 "updated_at": now,
                 "last_checked_at": now if just_downloaded else old.get("last_checked_at"),
                 "last_check_status": (
-                    "up_to_date" if just_downloaded
-                    else old.get("last_check_status")
+                    "up_to_date" if just_downloaded else old.get("last_check_status")
                 ),
             }
             self._save()
+
         logger.info(
             f"[registry] put {rel_path} <- {source}:{model_id}/{filename}"
             + (" (marked up_to_date)" if just_downloaded else "")
+        )
+        # ⭐ 新：写入后通知前端，界面自动刷新这一行的来源/状态
+        emit_model_updated(
+            rel_path,
+            status="up_to_date" if just_downloaded else None,
+            reason="download" if just_downloaded else "record",
         )
 
     def mark_checked(
@@ -136,6 +141,7 @@ class Registry:
         remote_mtime: Optional[float] = None,
         remote_etag: str = "",
     ) -> None:
+        """检测完成后更新状态并广播事件。"""
         self._ensure_loaded()
         with self._lock:
             rec = self._data.get(rel_path)
@@ -151,11 +157,14 @@ class Registry:
                 rec["remote_etag"] = remote_etag
             self._save()
 
+        emit_model_updated(rel_path, status=status, reason="check")
+
     def remove(self, rel_path: str) -> None:
         self._ensure_loaded()
         with self._lock:
             if self._data.pop(rel_path, None) is not None:
                 self._save()
+        emit_model_updated(rel_path, status=None, reason="remove")
 
     def remove_many(self, rel_paths: List[str]) -> int:
         self._ensure_loaded()
@@ -166,11 +175,13 @@ class Registry:
                     n += 1
             if n:
                 self._save()
+        for rp in rel_paths:
+            emit_model_updated(rp, status=None, reason="remove")
         return n
 
     # ---------- 清理 ----------
     def prune_missing(self, existing_rel_paths) -> int:
-        """删掉磁盘上已经不存在的记录。"""
+        """删掉磁盘上已不存在的记录。"""
         self._ensure_loaded()
         existing = set(existing_rel_paths)
         with self._lock:
