@@ -280,7 +280,7 @@ services:
 
 保存后，点 **「测试连接」** 应显示 `✓ 在线（/models）`，点 **「模型列表」** 应能看到服务端已识别的所有 `.gguf` 文件名。
 
-### 3.4 热切换工作原理（v1.3.0 关键修复）
+### 3.4 热切换工作原理（v1.2.0 关键修复）
 
 llama.cpp 路由模式有一个**关键行为**：
 
@@ -298,7 +298,7 @@ llama.cpp 路由模式有一个**关键行为**：
 }
 ```
 
-**正确流程**（GGUF-Manager v1.3.0 已自动化）：
+**正确流程**（GGUF-Manager v1.2.0 已自动化）：
 
 ```
 下载完成 → 写入 /models/xxx.gguf
@@ -351,11 +351,11 @@ docker logs --tail 30 llama-cpp-server
 
 #### Q: 报 400 `model is already running`？
 
-这是**幂等成功**——目标模型已经在运行，无需重复加载。v1.3.0 会自动识别并提示成功。
+这是**幂等成功**——目标模型已经在运行，无需重复加载。v1.2.0 会自动识别并提示成功。
 
 #### Q: 报 500 `model limit reached`？
 
-服务端已加载的模型数达到 `LLAMA_ARG_MODELS_MAX`。v1.3.0 会自动尝试「先 unload 再 load」兜底。或改用：
+服务端已加载的模型数达到 `LLAMA_ARG_MODELS_MAX`。v1.2.0 会自动尝试「先 unload 再 load」兜底。或改用：
 
 - 方式 A：卸载其他模型后再试
 - 方式 B：把 `LLAMA_ARG_MODELS_MAX` 调大
@@ -387,35 +387,7 @@ docker logs --tail 30 llama-cpp-server
 
 ---
 
-## 五、v1.3.0 更新日志
-
-### 核心变更
-
-- **事件驱动架构**：引入 SSE 事件总线，状态变化主动推送到前端，彻底解决"更新状态不及时刷新"问题
-- **实时状态同步**：下载完成、检测结束、配置变更等操作完成后自动刷新界面，无需手动检测
-- **代码优化**：从 19 个 Python 文件重构为更清晰的模块化架构（routers + sources 分层）
-- **合并冗余路由**：将 download.py + tasks.py 合并为 downloads.py，config.py + logs.py + llamacpp.py 合并为 system.py
-
-### llama.cpp 集成改进
-
-- ⭐ **路由模式热切换修复**：新增 `GET /models?reload=1` 前置刷新步骤，彻底解决"新下载的模型无法被服务端识别"问题
-- ⭐ **候选 id 多形式尝试**：自动尝试带/不带 `.gguf` 后缀、大小写归一、模糊匹配等多种 id 形式
-- ⭐ **400 / 500 智能处理**：`model is already running` 视为幂等成功；500 时自动尝试 unload + load 兜底
-- ⭐ **响应体完整记录**：失败时把每次请求的完整响应体返回给前端，便于排查
-
-### 事件类型
-
-| 事件名            | 触发时机                      |
-| ----------------- | ----------------------------- |
-| `model_updated`   | 模型记录（来源/更新状态）变化 |
-| `check_completed` | 一轮更新检测结束              |
-| `task_updated`    | 下载任务状态变化              |
-| `config_changed`  | 运行时配置被修改              |
-| `scheduler_tick`  | 定期检测调度器状态变化        |
-
----
-
-## 六、许可
+## 五、许可
 
 本项目基于 **GNU General Public License v3.0（GPL-3.0）** 开源。
 
@@ -427,7 +399,7 @@ docker logs --tail 30 llama-cpp-server
 
 ---
 
-## 七、致谢
+## 六、致谢
 
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) —— GGUF 格式与推理服务
 - [HuggingFace Hub](https://huggingface.co) 与 [ModelScope](https://modelscope.cn) —— 模型来源
