@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120" role="img" aria-label="GGUF Manager">
+  <defs>
+    <linearGradient id="gmBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#31465a"/>
+      <stop offset="1" stop-color="#1e2b38"/>
+    </linearGradient>
+    <linearGradient id="gmEdge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#c3d9ea"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="120" height="120" rx="27" fill="url(#gmBg)"/>
+
+  <!-- GGUF magic bytes: 'GGUF' four ASCII codes as the file header band -->
+  <g fill="#f39c12">
+    <rect x="15" y="15" width="19" height="7.5" rx="3.75" opacity="0.32"/>
+    <rect x="41" y="15" width="19" height="7.5" rx="3.75" opacity="0.55"/>
+    <rect x="67" y="15" width="19" height="7.5" rx="3.75" opacity="0.32"/>
+    <rect x="86" y="15" width="19" height="7.5" rx="3.75" opacity="0.85"/>
+  </g>
+
+  <!-- llama ears rising from the top facet -->
+  <path d="M45 50 L34 25 L60 42 Z" fill="#f39c12"/>
+  <path d="M75 50 L86 25 L60 42 Z" fill="#f39c12"/>
+
+  <!-- weight tensor cube (isometric) -->
+  <g stroke="url(#gmEdge)" stroke-width="6" stroke-linejoin="round" stroke-linecap="round" fill="none">
+    <path d="M60 52 L94 70 L60 88 L26 70 Z"/>
+    <path d="M26 70 L26 96 L60 114 L60 88"/>
+    <path d="M94 70 L94 96 L60 114"/>
+  </g>
+</svg>

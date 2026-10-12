@@ -28,6 +28,20 @@ header h1 {
     font-weight: 600;
 }
 
+header h1.brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.brand-logo {
+    display: block;
+    width: 30px;
+    height: 30px;
+    border-radius: 7px;
+    flex-shrink: 0;
+}
+
 nav {
     display: flex;
     gap: 8px;
