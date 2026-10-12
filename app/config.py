@@ -84,6 +84,9 @@ SETTINGS_FILENAME = "settings.json"
 _int_keys = {
     "hf_connect_timeout", "hf_read_timeout", "hf_max_retries",
     "log_buffer_size", "task_panel_autohide", "update_check_interval_minutes",
+    # ⭐ search_limit 也是整数：漏在表外时环境变量 SEARCH_LIMIT=50 会以字符串
+    #    形式进配置，日志里打印成 "50" 倒无妨，但任何数值比较都会静默出错。
+    "search_limit",
 }
 _float_keys = {"hf_retry_backoff", "hf_search_budget"}
 _bool_keys = {
@@ -131,7 +134,7 @@ class Settings:
     配置单例。所有读取走这里，保证“环境变量 / 文件 / 默认值”三层合并逻辑只有一份。
 
     字段做了两种暴露方式：
-      settings.log_level           —— 驼峰属性（兼容旧代码）
+      settings.log_level           —— 属性式（读取最顺手）
       settings["log_level"]        —— 字典式（as_dict / update 里用）
     """
 

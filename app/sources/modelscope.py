@@ -1,20 +1,20 @@
 """
 ModelScope 源后端。
 
-修复要点（v1.3.0）：
-1) 搜索改用 /openapi/v1/models 官方 snake_case 参数：search / page_size / page_number / sort。
-   旧代码用 PascalCase（Name/PageSize/PageNumber/SortBy）属于 /api/v1/ 旧接口，
-   OpenAPI 会直接忽略未知参数，等价于“不带关键词”返回默认列表。
-2) 响应解析优先取官方字段 `id`（旧版才是 path/Path/name/Name）。
-   旧代码 _get_field("path","Path","name","Name") 取不到值，紧接着
-   `if not path or "/" not in path: continue` 会把每个模型丢掉 → 搜索永远返回 0 条。
+接口与字段说明（易踩坑，逐条列明）：
+1) 搜索走 /openapi/v1/models 的 snake_case 参数：search / page_size / page_number / sort。
+   用 PascalCase（Name/PageSize/PageNumber/SortBy）会被 OpenAPI 当作未知参数忽略，
+   等价于“不带关键词”返回默认列表。
+2) 模型 ID 取官方字段 `id`；path/Path/name/Name 只出现在旧接口里。
+   若取不到值又紧跟 `if not path or "/" not in path: continue`，
+   会把每个模型都丢掉，搜索变成永远返回 0 条。
 3) GGUF 判定兼容官方 `tasks` 字段（OpenAPI 返回 tasks 而非 tags），
-   并把“仓库名是否含 gguf”提到最前作为最可靠的判据。
-4) 服务端搜索生效性校验由“只看第一条”改为“整页命中数”，
-   避免第一条恰好不匹配就误判、只翻一页就 break。
+   并把“仓库名是否含 gguf”放在最前作为最可靠的判据。
+4) 服务端搜索生效性校验看“整页命中数”，不能只看第一条 ——
+   否则第一条恰好不匹配就会误判，且只翻一页就 break。
 
 体积信息：搜索接口不返回文件大小，为保证搜索响应速度不在搜索时并发补拉，
-改由前端按需调 /api/search/size 懒加载（可见即加载）。文件列表走
+改由前端调 /api/search/sizes 批量补全。文件列表走
 /api/v1/models/{id}/repo/files，返回 Data.Files[].{Path,Size}。
 """
 
@@ -23,8 +23,8 @@ from typing import List, Dict, Optional
 import httpx
 
 from app.logger import get_logger
-from app.models import coerce_timestamp, sum_sizes
-from app.sources.base import SourceBackend
+from app.sources import SourceBackend, TTLCache, normalize_model_card
+from app.utils import coerce_timestamp, sum_sizes
 
 logger = get_logger(__name__)
 
@@ -52,12 +52,14 @@ HEADERS = {
 class ModelScopeBackend(SourceBackend):
     name = "modelscope"
 
+    # 文件列表缓存：同一个模型在一次「搜索 → 浏览 → 点开下载」里会被查两三次，
+    # 而每次都要全量拉一遍 /repo/files（大仓库有上百个文件）。
+    _files_cache = TTLCache(ttl=60.0, maxsize=512)
+
     # ============================================================
     # 搜索
     # ============================================================
     def search_models(self, query: str, gguf_only: bool = True, limit: int = 50) -> List[Dict]:
-        from app.sources.base import normalize_model_card
-
         logger.info(
             f"[MS] search_models: query={query!r}, gguf_only={gguf_only}, limit={limit}"
         )
@@ -155,7 +157,7 @@ class ModelScopeBackend(SourceBackend):
     # ============================================================
     def get_model_size(self, model_id: str) -> Dict:
         """查单模型 GGUF 总大小（前端懒加载）。"""
-        logger.info(f"[MS] get_model_size: model_id={model_id!r}")
+        logger.debug(f"[MS] get_model_size: model_id={model_id!r}")
         files = self.get_gguf_files(model_id)
         return {"gguf_count": len(files), "total_size": sum_sizes(f.get("size") for f in files)}
 
@@ -168,8 +170,16 @@ class ModelScopeBackend(SourceBackend):
 
         接口：GET /api/v1/models/{model_id}/repo/files?Revision=master&Recursive=true
         返回：{"Data": {"Files": [{"Name","Path","Size","Type","Sha256"}, ...]}}
+
+        带 60s TTL 缓存：搜索补全体积和「查看」文件列表会查同一个模型，
+        没必要拉两遍。
         """
-        logger.info(f"[MS] get_gguf_files: model_id={model_id!r}")
+        cached, hit = self._files_cache.get(model_id)
+        if hit:
+            logger.debug(f"[MS] get_gguf_files: cache hit, {len(cached)} files")
+            return cached
+
+        logger.debug(f"[MS] get_gguf_files: model_id={model_id!r}")
 
         url = MS_FILES_URL.format(model_id=model_id)
         params = {"Revision": "master", "Recursive": "true"}
@@ -200,7 +210,8 @@ class ModelScopeBackend(SourceBackend):
             })
 
         gguf_files.sort(key=lambda x: x["filename"])
-        logger.info(f"[MS] get_gguf_files: found {len(gguf_files)} gguf files")
+        logger.debug(f"[MS] get_gguf_files: found {len(gguf_files)} gguf files")
+        self._files_cache.set(model_id, gguf_files)
         return gguf_files
 
     def get_file_meta(self, model_id: str, filename: str) -> Dict:

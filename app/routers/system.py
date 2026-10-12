@@ -13,6 +13,7 @@ POST /api/llamacpp/reload   手动触发重载（可选传 model_path）
 GET  /api/llamacpp/models   拉取服务端模型列表
 POST /api/llamacpp/refresh  让路由模式重新读取模型源
 GET  /api/llamacpp/discover 探测服务端类型
+GET  /api/llamacpp/proxy    白名单端点的诊断代理
 
 GET  /api/events          SSE 事件流：状态变化实时推送
 """
@@ -25,17 +26,44 @@ from fastapi import APIRouter, Query
 from pydantic import BaseModel
 
 from app import __version__
-from app.config import settings, EDITABLE_KEYS, _LOG_LEVELS
+from app.config import EDITABLE_KEYS, _LOG_LEVELS, settings
+from app.events import bus, emit_config_changed, event_to_sse
 from app.logger import (
-    get_logger, get_timezone_name, set_timezone, set_level,
-    set_buffer_size, current_level_name, get_buffer_stats,
+    current_level_name,
+    get_buffer_stats,
+    get_logger,
+    get_logs,
+    get_timezone_name,
+    set_buffer_size,
+    set_level,
+    set_timezone,
 )
-from app.events import bus, event_to_sse, emit_config_changed
 from app.sources import huggingface, llamacpp
-from app.sources.updater import scheduler
+from app.sources.local import scheduler
 
 logger = get_logger(__name__)
 router = APIRouter(tags=["system"])
+
+
+def _apply_runtime_settings() -> Dict[str, Any]:
+    """
+    把 settings 里的值全量同步到运行时对象。
+
+    ⭐ 每次保存/重置都全量做一遍，而不是只处理“本次改动的那几项”：
+       值被改过又改回、或 reset 之后，只 apply 变化项会让运行时与配置文件不一致。
+    """
+    applied_tz = set_timezone(settings.get("timezone", "") or os.getenv("LOG_TZ", "Asia/Shanghai"))
+    applied_ep = huggingface.apply_endpoint(settings.hf_endpoint or "")
+    applied_lv = set_level(settings.log_level)
+    applied_n = set_buffer_size(settings.log_buffer_size)
+    llamacpp.reset_flavor_cache()  # 地址/类型可能刚变，探测结果作废
+
+    logger.info(
+        f"[/api/config] reloaded: timezone={applied_tz}, "
+        f"hf_endpoint={applied_ep or '(官方源)'}, log_level={applied_lv}, "
+        f"log_buffer_size={applied_n}"
+    )
+    return {"timezone": applied_tz, "hf_endpoint": applied_ep}
 
 
 # ============================================================
@@ -47,10 +75,9 @@ class ConfigPatch(BaseModel):
 
 @router.get("/api/config")
 async def get_config():
-    data = settings.as_dict()
     return {
         "version": __version__,
-        "values": data,
+        "values": settings.as_dict(),
         "editable": sorted(EDITABLE_KEYS),
         "model_dir": str(settings.MODEL_DIR),
         "config_path": str(settings.config_path),
@@ -67,19 +94,7 @@ async def update_config(patch: ConfigPatch):
     result = settings.update(patch.values or {})
     logger.info(f"[/api/config] applied={list(result['applied'].keys())}")
 
-    # ⭐ 保存后统一把“运行时生效”这件事做一遍，而不是只处理本次改动的那几项。
-    #    之前只 apply 变化项，一旦某个值被改过又被改回（或 reset 之后），
-    #    运行时的状态就和配置文件对不上了。现在每次保存都全量同步一次。
-    applied_tz = set_timezone(settings.get("timezone", "") or os.getenv("LOG_TZ", "Asia/Shanghai"))
-    applied_ep = huggingface.apply_endpoint(settings.hf_endpoint or "")
-    applied_lv = set_level(settings.log_level)
-    applied_n = set_buffer_size(settings.log_buffer_size)
-
-    logger.info(
-        f"[/api/config] reloaded: timezone={applied_tz}, "
-        f"hf_endpoint={applied_ep or '(官方源)'}, log_level={applied_lv}, "
-        f"log_buffer_size={applied_n}"
-    )
+    _apply_runtime_settings()
 
     # 开关变化后同步调度器状态
     if settings.update_check_enabled:
@@ -87,7 +102,7 @@ async def update_config(patch: ConfigPatch):
     elif "update_check_enabled" in result.get("applied", {}):
         scheduler.stop()
 
-    # ⭐ 新：广播配置变化，前端据此自动刷新徽标与本地列表
+    # 广播配置变化，前端据此自动刷新徽标与本地列表
     emit_config_changed()
 
     return {
@@ -103,12 +118,7 @@ async def update_config(patch: ConfigPatch):
 @router.post("/api/config/reset")
 async def reset_config():
     settings.reset()
-
-    set_timezone(settings.get("timezone", "") or os.getenv("LOG_TZ", "Asia/Shanghai"))
-    huggingface.apply_endpoint(settings.hf_endpoint or "")
-    set_level(settings.log_level)
-    set_buffer_size(settings.log_buffer_size)
-
+    _apply_runtime_settings()
     logger.info("[/api/config] reset to environment defaults and reloaded")
     emit_config_changed()
 
@@ -123,38 +133,13 @@ async def reset_config():
 # ============================================================
 # 日志
 # ============================================================
-# 日志级别 → 优先级数值，用于按级别过滤
-_LEVEL_ORDER = {n: i for i, n in enumerate(("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"))}
-
-
-def _get_logs(since_id: int = 0, min_level: str = "", limit: int = 500) -> list:
-    """读取内存缓冲区中的日志。"""
-    from app.logger import _log_buffer
-
-    min_num = _LEVEL_ORDER.get(min_level.upper(), 0) if min_level else 0
-
-    with _log_buffer._buf_lock:
-        entries = list(_log_buffer.buffer)
-
-    result = []
-    for entry in entries:
-        if entry["id"] <= since_id:
-            continue
-        if min_num and _LEVEL_ORDER.get(entry["level"], 0) < min_num:
-            continue
-        result.append(entry)
-
-    if len(result) > limit:
-        result = result[-limit:]
-    return result
-
-
 @router.get("/api/logs")
 async def list_logs(
     since: int = Query(0, ge=0, description="只返回 id 大于该值的日志"),
     limit: int = Query(500, ge=1, le=2000),
 ):
-    logs = _get_logs(since_id=since, limit=limit)
+    # 直接复用 logger 里的实现，避免两处过滤逻辑各写一份而逐渐漂移
+    logs = get_logs(since_id=since, limit=limit)
     return {"total": len(logs), "logs": logs}
 
 
@@ -180,8 +165,7 @@ async def llamacpp_status():
         except Exception as e:
             logger.exception(f"[/api/llamacpp/status] probe failed: {e}")
             probe = {"ok": False, "reachable": False, "error": f"{type(e).__name__}: {e}"}
-
-        # ⭐ 返回实际探测到的 flavor（与用户配置的分开显示）
+        # 实际探测到的 flavor（与用户配置的分开显示）
         try:
             detected_flavor = llamacpp._resolve_flavor()
         except Exception:
@@ -276,13 +260,16 @@ async def llamacpp_proxy(path: str = Query(..., description="要代理的 llama.
     try:
         async with httpx.AsyncClient(
             timeout=15.0,
-            headers={"User-Agent": "GGUF-Manager/1.3.0"},
+            headers={"User-Agent": f"GGUF-Manager/{__version__}"},
         ) as c:
             resp = await c.get(base + clean)
-            # 尝试解析 JSON，失败则返回文本
             try:
                 body = resp.json()
-            except (ValueError, json.JSONDecodeError):
+            except ValueError:
+                # ⚠️ 这里不要写 `except (ValueError, json.JSONDecodeError)`：
+                #    本模块并未 import json，一旦上游返回非 JSON，
+                #    求值 except 元组本身就会 NameError，把 500 变成 500+堆栈。
+                #    json.JSONDecodeError 本就是 ValueError 的子类，写 ValueError 足够。
                 body = {"raw": resp.text[:2000]}
             return {
                 "ok": 200 <= resp.status_code < 300,
@@ -303,60 +290,59 @@ async def events_stream(last_event_id: int = Query(0, description="断线重连�
     状态变化实时推送（Server-Sent Events）。
 
     前端用 EventSource 连接即可自动重连。连接建立时先回放 last_event_id
-    之后的历史事件，再持续推送新事件。这把原来“手动检测 + 定时轮询”
-    的模式改成了“被动接收”，更新状态不再需要手动触发。
+    之后的历史事件，再持续推送新事件。这把原来“手动检测 + 定时轮询”的
+    模式改成了“被动接收”，更新状态不再需要手动触发。
 
-    实现要点：EventBus 的订阅队列是同步 deque，这里在后台起一个线程
-    把同步事件桥接到 asyncio.Queue，避免异步生成器里阻塞等待。
+    实现要点：EventBus 的 publish 可能来自任意工作线程，
+    直接把事件投进 asyncio.Queue 不安全，因此注册一个回调，
+    由回调统一走 loop.call_soon_threadsafe 投递；连接结束时摘掉回调。
     """
-    from starlette.responses import StreamingResponse
     import asyncio
+
+    from starlette.responses import StreamingResponse
 
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
-    sync_q = bus.subscribe()
 
     # 先回放断线期间错过的事件
     for ev in bus.history(since_id=last_event_id):
-        await queue.put(ev)
+        queue.put_nowait(ev)
 
-    def _pump() -> None:
-        """后台线程：把同步队列里的事件桥接到 asyncio.Queue。"""
-        import time
-        while True:
-            try:
-                ev = sync_q.popleft()
-                loop.call_soon_threadsafe(queue.put_nowait, ev)
-            except IndexError:
-                time.sleep(1.0)
-            except Exception:
-                break
+    def _sink(event: Dict[str, Any]) -> None:
+        """由发布线程调用；必须在事件循环线程里入队。"""
 
-    pump = None
-    try:
-        import threading
-        pump = threading.Thread(target=_pump, name="sse-pump", daemon=True)
-        pump.start()
+        def _put() -> None:
+            # 客户端卡住时不让内存无限增长，超过上限就丢弃（前端还有轮询兜底）
+            if queue.qsize() < 1000:
+                queue.put_nowait(event)
 
-        async def stream():
+        try:
+            loop.call_soon_threadsafe(_put)
+        except RuntimeError:
+            pass  # 事件循环已关闭（服务正在退出）
+
+    bus.add_listener(_sink)
+
+    async def stream():
+        try:
             while True:
                 try:
                     ev = await asyncio.wait_for(queue.get(), timeout=15.0)
-                    yield event_to_sse(ev)
                 except asyncio.TimeoutError:
                     # 定时 keep-alive，防止代理/浏览器因空闲断开
                     yield ": keep-alive\n\n"
+                    continue
+                yield event_to_sse(ev)
+        finally:
+            # 客户端断开 / 服务关闭都会走到这里，摘掉回调不留悬挂订阅
+            bus.remove_listener(_sink)
 
-        return StreamingResponse(
-            stream(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",  # 穿透 nginx 反代，避免缓冲
-            },
-        )
-    finally:
-        # 注意：pump 线程在连接关闭时仍会运行直到下次 IndexError 休眠结束，
-        # 这是可接受的——单连接泄漏极小，且 EventBus 本身无上限订阅。
-        pass
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # 穿透 nginx 反代，避免缓冲
+        },
+    )

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>GGUF 模型管理器</title>
     <!-- v=4 版本号：改动静态文件后避免浏览器拿旧缓存 -->
-    <link rel="stylesheet" href="/static/style.css?v=24">
+    <link rel="stylesheet" href="/static/style.css?v=27">
 </head>
 <body>
     <header>
@@ -74,6 +74,46 @@
                 </div>
             </div>
 
+            <!-- 本地列表的过滤与排序（全部在浏览器端完成，不重新扫盘） -->
+            <div class="local-toolbar">
+                <div class="toolbar-group">
+                    <div class="local-filter-wrap">
+                        <input type="text" id="local-filter-input"
+                               placeholder="过滤：文件名 / 路径 / 来源仓库…"
+                               aria-label="过滤本地模型">
+                        <button id="local-filter-clear" class="local-filter-clear"
+                                title="清除过滤" aria-label="清除过滤">&times;</button>
+                    </div>
+
+                    <select id="local-filter-status" title="按状态过滤" aria-label="按状态过滤">
+                        <option value="all">全部状态</option>
+                        <option value="valid">仅有效模型</option>
+                        <option value="update_available">仅有更新</option>
+                        <option value="updatable">仅可检测更新</option>
+                        <option value="unknown_source">仅未知来源</option>
+                        <option value="incomplete">仅未完成缓存</option>
+                        <option value="corrupt">仅损坏 / 不可读</option>
+                    </select>
+
+                    <select id="local-sort" title="排序方式" aria-label="排序方式">
+                        <option value="default">默认排序</option>
+                        <option value="name-asc">文件名 ↑</option>
+                        <option value="name-desc">文件名 ↓</option>
+                        <option value="size-desc">大小 ↓</option>
+                        <option value="size-asc">大小 ↑</option>
+                        <option value="time-desc">修改时间 ↓（新→旧）</option>
+                        <option value="time-asc">修改时间 ↑（旧→新）</option>
+                        <option value="validity">有效性</option>
+                        <option value="status">更新状态</option>
+                        <option value="source">来源</option>
+                    </select>
+                </div>
+
+                <div class="toolbar-group toolbar-group-right">
+                    <span id="local-view-count" class="local-view-count"></span>
+                </div>
+            </div>
+
             <div id="local-results"></div>
         </section>
 
@@ -82,8 +122,8 @@
             <div class="log-panel">
                 <div class="log-toolbar">
                     <div class="toolbar-group">
-                        <!-- ⭐ 级别选择已移除，只在「设置 / 数据源与日志」里配置。
-                             日志页面不再提供级别选项，避免两处配置互相打架。 -->
+                        <!-- 日志级别只在「设置 / 数据源与日志」里配置，
+                             日志页面不提供级别选项，避免两处配置互相打架。 -->
                         <span id="log-level-badge" class="log-level-badge"
                               title="当前生效的日志级别，在「设置」里修改">级别 INFO</span>
 
@@ -373,6 +413,6 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=24"></script>
+    <script src="/static/app.js?v=27"></script>
 </body>
 </html>

@@ -1,13 +1,20 @@
 """
-数据模型 + 体积工具。
+体积 / 时间工具。
 
-体积格式统一放在这里，避免 huggingface / modelscope / scanner 三处各写一份不一致的实现。
-所有 Pydantic 请求/响应模型也集中在此，前端看不到后端内部类型。
+本文件只放跨模块共用的纯工具函数（体积 / 时间格式化）。
+
+这里不定义请求体模型：路由层实际收发的是普通 dict，真正需要校验的请求体
+（如 DownloadRequest）放在使用它的路由模块里就近维护。
+
+下面四个函数被 huggingface / modelscope / local 三处共用，
+集中一处避免各写一份、结果不一致。
 """
 
+import calendar
+from datetime import datetime
 from typing import Optional, Union
 
-from pydantic import BaseModel, ConfigDict
+from app.logger import LOG_TZ
 
 _SIZE_UNITS = ["B", "KB", "MB", "GB", "TB", "PB"]
 
@@ -74,27 +81,30 @@ def coerce_timestamp(value) -> Optional[float]:
         pass
 
     try:
-        from datetime import datetime
-        iso = text.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(iso)
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
         if dt.tzinfo is None:
-            import calendar
             return calendar.timegm(dt.utctimetuple())
         return dt.timestamp()
-    except Exception:
+    except (ValueError, OSError, OverflowError):
         pass
 
     return None
 
 
 def format_timestamp(ts) -> str:
-    """时间戳 → 可读时间（本地时区），用于界面展示。"""
+    """
+    时间戳 → 可读时间（本地时区），用于界面展示。
+
+    ⚠️ `datetime` 必须是模块级 import。若只在 coerce_timestamp 内部局部 import，
+    本函数直接引用会抛 NameError，被 except 吞掉后**永远返回空串**，
+    “远端更新时间”在界面上就会一直是空的。
+    LOG_TZ 在调用时才取，确保 set_timezone() 之后立刻生效。
+    """
     if ts is None:
         return ""
     try:
-        from app.logger import LOG_TZ
         return datetime.fromtimestamp(float(ts), LOG_TZ).strftime("%Y-%m-%d %H:%M")
-    except Exception:
+    except (TypeError, ValueError, OSError, OverflowError):
         return ""
 
 
@@ -115,70 +125,3 @@ def sum_sizes(sizes) -> Optional[int]:
         except (TypeError, ValueError):
             continue
     return total if known else None
-
-
-# ============================================================
-# Pydantic 请求 / 响应模型
-# ============================================================
-class SearchResult(BaseModel):
-    """搜索结果（含 GGUF 文件体积信息）。"""
-
-    id: str
-    author: str = ""
-    downloads: int = 0
-    likes: int = 0
-    last_modified: str = ""
-    tags: list[str] = []
-    has_gguf: bool = False
-    source: str = "huggingface"
-
-    gguf_count: int = 0
-    total_size: Optional[int] = None
-    total_size_human: str = ""
-    size_known: bool = False
-
-
-class DownloadRequest(BaseModel):
-    model_config = ConfigDict(protected_namespaces=())
-
-    model_id: str
-    filename: str = ""
-    source: str = "huggingface"
-    target_subdir: str = ""
-
-
-class LocalModel(BaseModel):
-    name: str
-    filename: str
-    path: str
-    relative_path: str
-    size: int
-    size_human: str
-    modified: float
-
-
-class GGUFFile(BaseModel):
-    filename: str
-    size: Optional[int] = None
-    size_human: str = ""
-
-
-class ModelSize(BaseModel):
-    """单个模型的体积查询结果（供前端懒加载）。"""
-
-    model_config = ConfigDict(protected_namespaces=())
-
-    model_id: str
-    source: str = "huggingface"
-    gguf_count: int = 0
-    total_size: Optional[int] = None
-    total_size_human: str = ""
-    size_known: bool = False
-    error: str = ""
-
-
-class DownloadPatch(BaseModel):
-    """更新检测时传入的模型清单（rel_paths 与 file_paths 二选一）。"""
-
-    file_paths: list[str] = []
-    rel_paths: list[str] = []

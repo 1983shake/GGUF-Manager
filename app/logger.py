@@ -18,6 +18,7 @@ import sys
 import threading
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 # ============================================================
 # 时区解析
@@ -86,6 +87,12 @@ _LEVEL_ORDER = {
     "DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50,
 }
 
+# 需要在 setup_logging / set_level 时同步降噪的第三方 logger
+_NOISY_LOGGERS = (
+    "httpx", "httpcore", "urllib3", "huggingface_hub", "modelscope",
+    "filelock", "asyncio", "multipart", "uvicorn.access",
+)
+
 # ============================================================
 # 内存环形缓冲区 handler
 # ============================================================
@@ -144,8 +151,26 @@ class RingBufferHandler(logging.Handler):
 
 
 # 唯一的模块级缓冲区实例：setup_logging 只调整它的容量，绝不重建，
-# 否则 get_logs / set_buffer_size 会拿到一个空的新对象（旧版曾踩过这个坑）。
+# 否则 get_logs / set_buffer_size 会拿到一个空的新对象，环形缓冲形同虚设。
 _log_buffer = RingBufferHandler(capacity=1000)
+
+# 控制台 Formatter 也只建一次：每次 setup_logging 都 new 一个并追加到
+# _FORMATTERS，重复调用会累积一堆没人用的 formatter，切时区时白遍历。
+_console_formatter: Optional[logging.Formatter] = None
+
+
+def _get_console_formatter() -> logging.Formatter:
+    global _console_formatter
+    if _console_formatter is None:
+        fmt = logging.Formatter(
+            fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        # ⭐ 让控制台时间戳也用本地时区（默认 time.localtime 在容器里通常是 UTC）
+        fmt.converter = _log_converter
+        _console_formatter = fmt
+        _FORMATTERS.append(fmt)
+    return _console_formatter
 
 
 def setup_logging(level: str = "INFO", buffer_size: int = 1000, tz_name: str = "") -> None:
@@ -157,14 +182,6 @@ def setup_logging(level: str = "INFO", buffer_size: int = 1000, tz_name: str = "
 
     numeric_level = getattr(logging, str(level).upper(), logging.INFO)
 
-    formatter = logging.Formatter(
-        fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    # ⭐ 让控制台时间戳也用本地时区（默认 time.localtime 在容器里通常是 UTC）
-    formatter.converter = _log_converter
-    _FORMATTERS.append(formatter)
-
     # 只调整容量，不新建对象 —— 保证 get_logs 始终读到同一份数据
     _log_buffer.resize(buffer_size)
     _log_buffer.setLevel(numeric_level)
@@ -175,29 +192,19 @@ def setup_logging(level: str = "INFO", buffer_size: int = 1000, tz_name: str = "
         root.removeHandler(h)
 
     stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setFormatter(formatter)
+    stream_handler.setFormatter(_get_console_formatter())
 
     root.addHandler(stream_handler)
     root.addHandler(_log_buffer)
     root.setLevel(numeric_level)
 
     # 第三方库降噪：避免 httpx 重试刷屏掩盖真实错误
-    for noisy in (
-        "httpx", "httpcore", "urllib3", "huggingface_hub", "modelscope",
-        "filelock", "asyncio", "multipart", "uvicorn.access",
-    ):
+    for noisy in _NOISY_LOGGERS:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(name)
-
-
-# 需要在改级别/容量时同步调整的 logger 集合
-_NOISY_LOGGERS = (
-    "httpx", "httpcore", "urllib3", "huggingface_hub", "modelscope",
-    "filelock", "asyncio", "multipart", "uvicorn.access",
-)
 
 
 def set_level(level: str) -> str:

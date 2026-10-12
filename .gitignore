@@ -1,0 +1,73 @@
+# ==============================================================
+# GGUF-Manager .gitignore
+# 覆盖三部分：Python 产物 / 运行时数据 / 编辑器与系统文件
+# ==============================================================
+
+# ---------------- Python ----------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# 测试 / 类型检查 / lint 缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+nosetests.xml
+
+# ---------------- 运行时数据 ----------------
+# 标记为“不入库但请在本机保留”：部署时由挂载卷提供
+models/
+*.gguf
+*.gguf.part
+*.part
+config/
+.gguf-manager/
+logs/
+*.log
+tmp/
+temp/
+
+# ---------------- 环境变量与密钥 ----------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---------------- 编辑器 / IDE ----------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*.iml
+*~
+
+# ---------------- 操作系统 ----------------
+.DS_Store
+._*
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# ---------------- Docker ----------------
+docker-compose.override.yml

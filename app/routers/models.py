@@ -1,15 +1,17 @@
 """
 本地模型管理路由。
 
-GET    /api/models              扫描本地模型（附带来源与更新状态）
-DELETE /api/models              删除单个文件
-POST   /api/models/batch-delete 批量删除
-POST   /api/models/check        检测更新（指定或全部）
-GET|POST /api/models/check-one  检测单个模型（供每行“检测”按钮）
-POST   /api/models/update       更新模型（重新下载，完成后原子替换）
-POST   /api/models/clear-cache  清理 .gguf.part 缓存
-GET    /api/models/schedule     定期检测任务状态
+GET      /api/models              扫描本地模型（附带来源与更新状态）
+DELETE   /api/models              删除单个文件
+POST     /api/models/batch-delete 批量删除
+POST     /api/models/check        检测更新（指定或全部）
+GET|POST /api/models/check-one    检测单个模型（供每行“检测”按钮）
+POST     /api/models/update       更新模型（重新下载，完成后原子替换）
+POST     /api/models/clear-cache  清理 .gguf.part 缓存
+GET      /api/models/schedule     定期检测任务状态
 
+排序与过滤在浏览器端完成（见 static/app.js 的 applyLocalView）：
+列表本来就要整表扫描一次，前端已有全量数据，再往返一次后端纯属浪费。
 """
 
 from typing import Dict, List, Optional
@@ -21,9 +23,15 @@ from app.config import settings
 from app.logger import get_logger
 from app.sources import llamacpp
 from app.sources.downloader import manager
-from app.sources.scanner import clear_cache, delete_model, scan_models
-from app.sources.registry import registry, rel_path_of
-from app.sources.updater import check_all, check_one, scheduler
+from app.sources.local import (
+    check_all,
+    check_one,
+    clear_cache,
+    delete_model,
+    registry,
+    scan_models,
+    scheduler,
+)
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/models", tags=["models"])
@@ -42,12 +50,6 @@ def list_local_models(path: str = Query("", description="自定义扫描路径")
     scan_dir = path if path else str(settings.MODEL_DIR)
     logger.info(f"[/api/models] scan_dir={scan_dir!r}")
     models = scan_models(scan_dir)
-
-    # 外部挂载目录没有注册表归属，不附加来源信息
-    if path:
-        for m in models:
-            if "source" not in m:
-                m["has_update_info"] = False
 
     incomplete = [m for m in models if m.get("is_part")]
     invalid = [m for m in models if m.get("validity") in ("corrupt", "unreadable")]
@@ -68,6 +70,28 @@ def list_local_models(path: str = Query("", description="自定义扫描路径")
 
 
 # ------------------------------------------------------------
+# llama.cpp 联动
+# ------------------------------------------------------------
+def _notify_llamacpp(reason: str) -> Optional[Dict]:
+    """
+    通知 llama.cpp 模型集合有变化（新增/删除）。
+
+    ⭐ 路由模式不监听磁盘，必须让它重新扫描；否则服务端列表里还留着已删模型。
+
+    这里只做本地开关判断（未启用 / 未配地址直接跳过），有变化就让它重扫 ——
+    不要为了“有没有候选模型名”先调一次 list_models()：那是一次实打实的
+    HTTP 请求，代价高而信息量为零。
+    """
+    if not settings.llamacpp_enabled or not (settings.llamacpp_url or "").strip():
+        return None
+    try:
+        return llamacpp.reload(reason=reason)
+    except Exception as e:
+        logger.warning(f"[/api/models] llamacpp notify failed: {e}")
+        return None
+
+
+# ------------------------------------------------------------
 # 删除
 # ------------------------------------------------------------
 @router.delete("")
@@ -76,13 +100,9 @@ def remove_model(file_path: str = Query(...)):
     try:
         success = delete_model(file_path, str(settings.MODEL_DIR))
         logger.info(f"[/api/models] delete success={success}")
-
-        # ⭐ 删掉后通知 llama.cpp：路由模式不监听磁盘，
-        #    不重新扫描的话服务端列表里还留着这个模型。
-        if success:
-            notify = llamacpp_notify(reason="delete", file_path=file_path)
-            return {"success": True, "llamacpp": notify}
-        return {"success": False}
+        if not success:
+            return {"success": False}
+        return {"success": True, "llamacpp": _notify_llamacpp("delete")}
     except ValueError as e:
         logger.warning(f"[/api/models] delete rejected: {e}")
         return {"error": str(e)}
@@ -98,7 +118,6 @@ def batch_remove(req: PathsRequest):
     logger.info(f"[/api/models/batch-delete] {len(paths)} files")
 
     deleted, failed = [], []
-
     for p in paths:
         try:
             if delete_model(p, str(settings.MODEL_DIR)):
@@ -111,50 +130,15 @@ def batch_remove(req: PathsRequest):
             logger.exception(f"[/api/models/batch-delete] {p} failed: {e}")
             failed.append({"path": p, "error": str(e)})
 
-    llamacpp_notify = None
-    if deleted:
-        llamacpp_notify = llamacpp_batch_notify(deleted, reason="delete")
-
+    notify = _notify_llamacpp("delete") if deleted else None
     logger.info(f"[/api/models/batch-delete] deleted={len(deleted)} failed={len(failed)}")
-    return {"success": len(failed) == 0, "deleted": deleted, "failed": failed,
-            "deleted_count": len(deleted), "llamacpp": llamacpp_notify}
-
-
-def _server_names_for(file_path: str) -> List[str]:
-    """算出本地文件在 llama.cpp 那边可能的模型名（用于卸载）。"""
-    try:
-        matched = llamacpp.match_remote_name(file_path)
-        if matched:
-            return [matched]
-        return llamacpp.local_name_candidates(file_path)[:2]
-    except Exception:
-        return []
-
-
-def llamacpp_notify(reason: str, file_path: str = "", names: Optional[List[str]] = None) -> Optional[Dict]:
-    """通知 llama.cpp 模型变化。"""
-    try:
-        if names is None:
-            names = _server_names_for(file_path) if file_path else []
-        if not names:
-            return None
-        res = llamacpp.reload(reason=reason)
-        return res
-    except Exception as e:
-        logger.warning(f"[/api/models] llamacpp notify failed: {e}")
-        return None
-
-
-def llamacpp_batch_notify(deleted: List[str], reason: str) -> Optional[Dict]:
-    try:
-        names: List[str] = []
-        for p in deleted:
-            names.extend(_server_names_for(p))
-        if not names:
-            return None
-        return llamacpp.reload(reason=reason)
-    except Exception:
-        return None
+    return {
+        "success": len(failed) == 0,
+        "deleted": deleted,
+        "failed": failed,
+        "deleted_count": len(deleted),
+        "llamacpp": notify,
+    }
 
 
 # ------------------------------------------------------------
@@ -165,7 +149,7 @@ def clear_part_cache():
     """
     清理所有下载中断留下的 .gguf.part 缓存文件。
 
-    取消/失败的下载会在磁盘上留下大量残留，界面上看不到也删不掉，
+    取消/失败的下载会在磁盘上留下大量残留，界面上也可以逐条删除，
     这个接口一次性清干净。
     """
     logger.info("[/api/models/clear-cache] requested")

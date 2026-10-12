@@ -1,13 +1,73 @@
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
+# ==============================================================
+# GGUF-Manager .dockerignore
+# 构建镜像只需要 requirements.txt + app/，
+# 其余内容不进构建上下文，避免把模型、配置、缓存打进镜像层。
+# ==============================================================
+
+# ---------------- 版本控制与忽略文件 ----------------
 .git/
 .gitignore
-.env
-*.egg-info
+.dockerignore
+.github/
+
+# ---------------- Python 产物 ----------------
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# 虚拟环境（绝不允许进入镜像）
+.venv/
+venv/
+env/
+ENV/
+
+# 测试 / 缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
 tests/
+test_*.py
+
+# ---------------- 运行时数据 ----------------
+# 模型与配置在运行时由挂载卷提供，不打进镜像
+models/
+*.gguf
+*.gguf.part
+*.part
+config/
+.gguf-manager/
+logs/
+*.log
+tmp/
+temp/
+
+# ---------------- 环境变量与密钥 ----------------
+.env
+.env.*
+*.pem
+*.key
+
+# ---------------- 文档 ----------------
+*.md
+
+# ---------------- 编辑器 / 操作系统 ----------------
 .vscode/
 .idea/
-models/
-*.md
+*.swp
+*.swo
+*.iml
+.DS_Store
+._*
+Thumbs.db
+desktop.ini

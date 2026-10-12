@@ -6,24 +6,25 @@ llama.cpp 集成。
   llamaswap   llama-swap 代理
   server      普通 llama-server（单模型）
 
-v1.3.0-fix3（本次修复 - 关键）：
+核心约束（关键，不要改动这个顺序）：
   · ⭐ 路由模式重载前必须先调 GET /models?reload=1 让服务端重新扫描磁盘！
     原因：llama.cpp 路由模式只在启动时扫描一次 LLAMA_ARG_MODELS_DIR，
     运行期间不监听磁盘变化。新下载的模型文件虽然在磁盘上，但服务端内存里
     没有它的记录，POST /models/load 会直接返回 404 File Not Found。
-  · 在 _reload_by_http() 里对 router/llamaswap 增加 pre-refresh 步骤，
-    随后再选 id、再 load，一气呵成。
-  · 保留之前所有修复：候选 id 多形式尝试 / 400 already running 幂等 /
+  · 因此 _reload_by_http() 对 router/llamaswap 先做 pre-refresh，再选 id、再 load。
+  · 其余健壮性处理：候选 id 多形式尝试 / 400 already running 视为幂等 /
     500 记录响应体 / 大模型加载超时宽容处理。
 """
 
 import json
 import os
 import subprocess
+import time
 from typing import Optional, Dict, List
 
 import httpx
 
+from app import __version__
 from app.config import settings
 from app.logger import get_logger
 
@@ -33,6 +34,11 @@ HTTP_CONNECT_TIMEOUT = 10.0
 HTTP_READ_TIMEOUT = 30.0
 LOAD_READ_TIMEOUT = 120.0
 
+# flavor 探测缓存：一次探测最多 3 个 HTTP 请求，而 /api/llamacpp/status
+# 和 probe() 会连续调用它，重载流程里更是会调很多次。缓存 30 秒足够，
+# 手动「自动诊断」时用 force=True 绕过。
+FLAVOR_TTL = 30.0
+
 
 MODELS_LOAD_ENDPOINTS = ("/models/load",)
 MODELS_UNLOAD_ENDPOINTS = ("/models/unload",)
@@ -41,7 +47,7 @@ SERVER_RELOAD_ENDPOINTS = ("/update",)
 
 
 def _headers() -> dict:
-    h = {"User-Agent": "GGUF-Manager/1.3.0", "Accept": "application/json"}
+    h = {"User-Agent": f"GGUF-Manager/{__version__}", "Accept": "application/json"}
     key = (settings.llamacpp_api_key or "").strip()
     if key:
         h["Authorization"] = f"Bearer {key}"
@@ -65,7 +71,16 @@ def _base() -> str:
     return (settings.llamacpp_url or "").rstrip("/")
 
 
-def _resolve_flavor() -> str:
+_flavor_cache: Dict[str, object] = {"key": None, "value": "unknown", "at": 0.0}
+
+
+def _resolve_flavor(force: bool = False) -> str:
+    """
+    解析服务端类型。
+
+    显式配置优先；配置为 auto 时探测并缓存 FLAVOR_TTL 秒，
+    避免同一次请求流程里反复发探测请求。
+    """
     configured = settings.llamacpp_flavor or "auto"
     if configured != "auto":
         return configured
@@ -74,6 +89,25 @@ def _resolve_flavor() -> str:
     if not base:
         return "unknown"
 
+    now = time.time()
+    if (
+        not force
+        and _flavor_cache["key"] == base
+        and (now - float(_flavor_cache["at"])) < FLAVOR_TTL
+    ):
+        return str(_flavor_cache["value"])
+
+    flavor = _detect_flavor(base)
+    _flavor_cache.update(key=base, value=flavor, at=now)
+    return flavor
+
+
+def reset_flavor_cache() -> None:
+    """配置变更后调用，让下一次探测重新走网络。"""
+    _flavor_cache.update(key=None, value="unknown", at=0.0)
+
+
+def _detect_flavor(base: str) -> str:
     with _client() as c:
         # 1) /models 是路由模式专属端点
         try:
@@ -149,9 +183,10 @@ def probe() -> dict:
 
 
 def discover_flavor(force_refresh: bool = False) -> dict:
-    flavor = _resolve_flavor()
+    """探测服务端类型。force_refresh=True 时忽略 30 秒缓存重新探测。"""
+    flavor = _resolve_flavor(force=force_refresh)
     if flavor == "unknown":
-        return {"flavor": "unknown", "reason": "无法识别"}
+        return {"flavor": "unknown", "reason": "无法识别（/models、/props、/v1/models 均未命中）"}
     return {"flavor": flavor, "reason": "探测完成"}
 
 
@@ -348,14 +383,30 @@ def _has_docker_cmd() -> bool:
     return bool(cmd) and ("docker" in cmd or "podman" in cmd or "restart" in cmd)
 
 
-def _pick_model_ids(model_path: Optional[str]) -> List[str]:
+def _pick_model_ids(
+    model_path: Optional[str],
+    entries: Optional[List[dict]] = None,
+) -> List[str]:
     """
     返回候选 model id 列表（按优先级）。
 
-    ⚠️ 必须在 pre-refresh 之后调用，这样 _fetch_router_entries()
-       才能拿到包含新下载模型的 id 列表。
+    ⚠️ 必须在 pre-refresh 之后调用，这样才能拿到包含新下载模型的 id 列表。
+
+    entries: 已归一化的 [{"id","status"}] 列表。_reload_by_http() 会把
+             pre-refresh 的结果传进来，省掉一次多余的 GET /models。
+
+    ⭐ 把「服务端实际认得的 id」排到最前。
+       路由模式下 /models 报出来的 id 是文件名去掉 .gguf 的 stem，
+       而完整路径（/app/models/x.gguf）和带扩展名的写法都会 404。
+       把完整路径排在第一位会让每次重载白扔 2 个必然失败的 POST，
+       每个都要等一次 HTTP 往返。
     """
-    entries = _fetch_router_entries()
+    if entries is None:
+        entries = [
+            {"id": it.get("id", ""), "status": _normalize_status(it)}
+            for it in _fetch_router_entries()
+        ]
+
     available = [it.get("id", "") for it in entries if it.get("id")]
 
     result: List[str] = []
@@ -373,7 +424,19 @@ def _pick_model_ids(model_path: Optional[str]) -> List[str]:
         p = Path(model_path)
         stem = p.stem
         name = p.name
+        lower_stem = stem.lower()
+        lower_name = name.lower()
 
+        def mid_stem_of(mid: str) -> str:
+            return mid[:-5] if mid.lower().endswith(".gguf") else mid
+
+        # ① 强匹配：服务端 id（去扩展名后）与本地 stem / 文件名相等 → 置顶
+        for mid in available:
+            ms = mid_stem_of(mid).lower()
+            if ms == lower_stem or ms == lower_name or mid.lower() == lower_stem:
+                add(mid)
+
+        # ② 本地推断的写法（服务端不认得时兜底）
         add(model_path)
         add(name)
         add(stem)
@@ -382,28 +445,14 @@ def _pick_model_ids(model_path: Optional[str]) -> List[str]:
         if not name.lower().endswith(".gguf"):
             add(name + ".gguf")
 
-        # 在 /models 返回的 id 里做模糊匹配，把命中的提前
-        lower_stem = stem.lower()
-        lower_name = name.lower()
+        # ③ 弱匹配（子串包含）：命中概率低，排在最后
         for mid in available:
-            mid_lower = mid.lower()
-            mid_stem = mid[:-5] if mid_lower.endswith(".gguf") else mid
-            mid_stem_lower = mid_stem.lower()
-            if (
-                mid == stem
-                or mid == name
-                or mid_stem == stem
-                or mid_stem == name
-                or mid_stem_lower == lower_stem
-                or mid_stem_lower == lower_name
-                or mid_lower == lower_stem
-                or lower_stem in mid_stem_lower
-                or mid_stem_lower in lower_name
-            ):
+            ms = mid_stem_of(mid).lower()
+            if lower_stem in ms or ms in lower_name:
                 add(mid)
     else:
         # 未指定：优先选 unloaded（换一个跑，避免 already running）
-        unloaded = [it for it in entries if _normalize_status(it) in ("unloaded", "not_loaded", "idle")]
+        unloaded = [it for it in entries if it.get("status") in ("unloaded", "not_loaded", "idle")]
         if unloaded:
             add(unloaded[0].get("id", ""))
         for it in entries:
@@ -441,8 +490,7 @@ def _reload_by_http(base: str, model_path: Optional[str] = None) -> dict:
     """
     通过 HTTP 端点触发重载。
 
-    ⭐ 核心改进（v1.3.0-fix3）：
-       路由模式下 **先 refresh，再 load**。
+    ⭐ 路由模式下 **先 refresh，再 load**。
        llama.cpp 路由模式只在启动时扫描一次 LLAMA_ARG_MODELS_DIR，
        运行期间不监听磁盘变化。新下载的模型必须通过
        GET /models?reload=1 让服务端重新扫描，否则 POST /models/load
@@ -456,7 +504,10 @@ def _reload_by_http(base: str, model_path: Optional[str] = None) -> dict:
     # ⭐⭐⭐ 关键：路由模式先 refresh，让服务端重新扫描磁盘
     pre_refresh: Optional[dict] = None
     if flavor in ("router", "llamaswap"):
-        logger.info(f"[llamacpp] router flavor detected, " f"pre-refresh via GET /models?reload=1 before load")
+        logger.info(
+            "[llamacpp] router flavor detected, "
+            "pre-refresh via GET /models?reload=1 before load"
+        )
         try:
             pre_refresh = refresh_models()
             logger.info(f"[llamacpp] pre-refresh result: ok={pre_refresh.get('ok')}, " f"models_count={pre_refresh.get('models_count', '?')}")
@@ -464,8 +515,16 @@ def _reload_by_http(base: str, model_path: Optional[str] = None) -> dict:
             logger.warning(f"[llamacpp] pre-refresh failed: {e}")
             pre_refresh = {"ok": False, "error": str(e)}
 
-    # ⭐ 在 refresh 之后再选 id（此时 /models 已包含新下载的模型）
-    candidate_ids = _pick_model_ids(model_path)
+    # ⭐ 在 refresh 之后再选 id（此时 /models 已包含新下载的模型）。
+    #    注意：pre-refresh 的响应里已经带回了 id 列表，直接复用即可，
+    #    不必为了选 id 再发一次 GET /models。
+    pre_entries = [
+        {"id": m.get("id", ""), "status": m.get("status", "")}
+        for m in (pre_refresh or {}).get("models", [])
+        if m.get("id")
+    ] if (pre_refresh or {}).get("ok") else None
+
+    candidate_ids = _pick_model_ids(model_path, entries=pre_entries)
     logger.info(f"[llamacpp] reload: flavor={flavor}, model_path={model_path!r}, " f"candidates={candidate_ids}")
 
     if not candidate_ids and flavor in ("router", "llamaswap"):

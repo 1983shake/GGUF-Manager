@@ -287,6 +287,13 @@ function sizeBadgeHtml(r) {
     return `<span class="size-badge loading" title="正在获取文件大小">💾 计算中…</span>`;
 }
 
+// ⭐ 批量补全：走 /api/search/sizes 一次补齐一整片，而不是每个模型打一次
+//    /api/search/size。
+//    理由是 model_id 里的 `/` 编码后会膨胀，逐个请求既慢又会把日志刷满，
+//    分片批量后 50 条搜索结果只需 1~3 个请求。
+const SIZE_BATCH = 20;        // 每片多少个模型
+const SIZE_BATCH_CONCURRENCY = 3;  // 同时发几片
+
 async function fillMissingSizes(results) {
     const pending = results.filter(r =>
         r.has_gguf && !r.size_known && !sizeCache.has(`${r.source}::${r.id}`)
@@ -294,21 +301,73 @@ async function fillMissingSizes(results) {
     if (!pending.length) return;
 
     const container = document.getElementById('search-results');
-    const CONCURRENCY = 6;
-    let cursor = 0;
+    const batches = buildSizeBatches(pending);
 
+    let cursor = 0;
     async function worker() {
-        while (cursor < pending.length) {
-            const item = pending[cursor++];
-            const data = await fetchSize(item.id, item.source);
-            applySizeToCard(container, item, data);
+        while (cursor < batches.length) {
+            const { source, items } = batches[cursor++];
+            const recs = await fetchSizes(items, source);
+            const byId = new Map(recs.map(r => [r.model_id, r]));
+
+            for (const item of items) {
+                // 后端承诺「单个失败不影响其他条目」，但整片失败时这里兜底，
+                // 否则卡片会永远停在“计算中…”
+                const rec = byId.get(item.id) || {
+                    model_id: item.id, gguf_count: 0, total_size: null,
+                    total_size_human: '', size_known: false, error: 'no result',
+                };
+                sizeCache.set(`${source}::${item.id}`, rec);
+                applySizeToCard(container, item, rec);
+            }
         }
     }
 
     await Promise.all(
-        Array.from({ length: Math.min(CONCURRENCY, pending.length) }, worker)
+        Array.from({ length: Math.min(SIZE_BATCH_CONCURRENCY, batches.length) }, worker)
     );
     updateSizeRetryVisibility(results);
+}
+
+/**
+ * 把待补全的模型按 source 分组、再按 SIZE_BATCH 切片。
+ *
+ * 分片是必需的：model_id 里的 "/" 经 URL 编码会变成 "%2F"，
+ * 单条 id 就能膨胀到 50 字符上下，50 个拼进 query string 轻松超过
+ * 2000 字符 —— 要么被中间代理截断，要么直接 414 URI Too Long。
+ */
+function buildSizeBatches(pending) {
+    const bySource = new Map();
+    for (const item of pending) {
+        if (!bySource.has(item.source)) bySource.set(item.source, []);
+        bySource.get(item.source).push(item);
+    }
+
+    const batches = [];
+    for (const [source, items] of bySource) {
+        for (let i = 0; i < items.length; i += SIZE_BATCH) {
+            batches.push({ source, items: items.slice(i, i + SIZE_BATCH) });
+        }
+    }
+    return batches;
+}
+
+async function fetchSizes(items, source) {
+    const params = new URLSearchParams();
+    params.set('source', source);
+    for (const it of items) params.append('model_id', it.id);
+
+    try {
+        const res = await fetch(`${API}/api/search/sizes?${params.toString()}`);
+        const data = await res.json();
+        return Array.isArray(data.sizes) ? data.sizes : [];
+    } catch (e) {
+        // 让整片失败也降级成“未取到”，由重试按钮兜底
+        return items.map(it => ({
+            model_id: it.id, gguf_count: 0, total_size: null,
+            total_size_human: '', size_known: false, error: e.message,
+        }));
+    }
 }
 
 async function fetchSize(modelId, source) {
@@ -510,13 +569,13 @@ document.getElementById('task-panel-close').addEventListener('click', (e) => {
     renderNetSpeed(0, 0);
 });
 
-// ⭐ 底部「清除已结束」已移除：已结束的记录在面板自动收起时自动清掉
+// ⭐ 面板底部不放「清除已结束」按钮：已结束的记录在面板自动收起时自动清掉。
 
 // 注意：这里刻意不做"鼠标悬停暂停"。
-// 面板固定在右下角，鼠标很容易正好停在它上面，一旦暂停就再也等不到收起时机——
-// 这正是上一版弹窗常驻不消失的成因。改为显示倒计时 + 提供手动关闭按钮。
+// 面板固定在右下角，鼠标很容易正好停在它上面，一旦暂停就再也等不到收起时机，
+// 弹窗会常驻不消失。改为显示倒计时 + 提供手动关闭按钮。
 
-// ⭐ 底部「全部取消」已移除：取消在每个任务行上单独操作，
+// ⭐ 面板底部不放「全部取消」按钮：取消在每个任务行上单独操作，
 //    更精确，也不会误伤正在跑的任务。这里是供面板收起时清理完成任务用的。
 async function clearFinishedTasks() {
     try {
@@ -748,7 +807,7 @@ function renderTasks(tasks) {
     });
 
     const active = tasks.filter(t => t.status === 'pending' || t.status === 'downloading').length;
-    // ⭐ 面板顶部不再显示标题文字（元素已移除）
+    // 面板顶部不放标题文字：任务数量与状态由卡片和徽标表达即可
 
     const spinner = document.querySelector('.task-spinner');
     if (spinner) spinner.classList.toggle('idle', !active);
@@ -803,7 +862,7 @@ function taskCardHtml(t) {
 }
 
 function renderNetSpeed(bps, active) {
-    // ⭐ 顶部速度指示与面板标题栏速度都已移除。
+    // ⭐ 顶部速度指示与面板标题栏都不显示速度。
     //    速度在每个任务行内显示（更直观对应到具体文件），
     //    这里只根据是否有活动任务切换 spinner 动效。
     const spinner = document.querySelector('.task-spinner');
@@ -811,12 +870,164 @@ function renderNetSpeed(bps, active) {
 }
 
 // ============================================================
-// 本地模型管理（含批量操作与更新检测）
+// 本地模型管理（含批量操作、更新检测、过滤与排序）
 // ============================================================
 let localModels = [];
 let lastScanDir = '';
+let localScanned = false;        // 是否已经扫过一次（避免首次进页面就显示“无匹配”）
 const selectedPaths = new Set();
-const updateStatus = new Map();   // rel_path -> 检测结果
+const updateStatus = new Map();  // rel_path -> 检测结果
+
+// ---------- 过滤 / 排序：全部在浏览器端完成 ----------
+// 列表本来就一次性全量拿回来了，后端再排一遍纯属多跑一趟；
+// 而且过滤不应触发重新扫盘（大目录扫一次要几秒）。
+const VALIDITY_RANK = { valid: 0, incomplete: 1, corrupt: 2, unreadable: 3 };
+const UPD_STATUS_RANK = {
+    update_available: 0, local_mismatch: 1, check_failed: 2, up_to_date: 3, unknown: 4,
+};
+
+function localFilterKeyword() {
+    const el = document.getElementById('local-filter-input');
+    return ((el && el.value) || '').trim().toLowerCase();
+}
+
+function localFilterStatus() {
+    const el = document.getElementById('local-filter-status');
+    return (el && el.value) || 'all';
+}
+
+/** 把下拉框的值（如 "size-desc"）拆成 { key, dir }。 */
+function localSortSpec() {
+    const el = document.getElementById('local-sort');
+    const v = (el && el.value) || 'default';
+    const i = v.lastIndexOf('-');
+    if (i < 0) return { key: v, dir: 'asc' };
+    return { key: v.slice(0, i), dir: v.slice(i + 1) };
+}
+
+/**
+ * 该行在“更新状态 / 检测 / 更新”语境下的唯一键。
+ *
+ * ⭐ 用后端返回的 rel_path（相对 MODEL_DIR），而不是界面上展示的 relative_path
+ *    （相对扫描根）—— 当「扫描路径」指向 MODEL_DIR 的某个子目录或外部目录时，
+ *    两者不同，用展示值去查注册表会一路“无来源记录”。
+ */
+function localRelKey(m) {
+    return (m && (m.rel_path || m.relative_path)) || '';
+}
+
+/** 行内生效的更新状态：优先用刚检测出来的缓存，其次用扫描时带回来的。 */
+function effectiveLocalStatus(m) {
+    if (!m.has_update_info) return 'unknown';
+    const cached = updateStatus.get(localRelKey(m));
+    if (cached && cached.status) return cached.status;
+    return m.last_check_status || 'unknown';
+}
+
+function matchLocalStatus(m, st) {
+    switch (st) {
+        case 'valid':            return !m.is_part && m.validity === 'valid';
+        case 'incomplete':       return !!m.is_part;
+        case 'corrupt':          return m.validity === 'corrupt' || m.validity === 'unreadable';
+        case 'updatable':        return !!m.has_update_info;
+        case 'unknown_source':   return !m.is_part && !m.has_update_info;
+        case 'update_available': return effectiveLocalStatus(m) === 'update_available';
+        default:                 return true;
+    }
+}
+
+function matchesLocalFilter(m) {
+    if (!matchLocalStatus(m, localFilterStatus())) return false;
+
+    const kw = localFilterKeyword();
+    if (!kw) return true;
+    // rel_path 与 relative_path 都收进搜索范围：前者是相对模型目录的完整路径，
+    // 后者是界面展示值，扫子目录/外部目录时两者不同，只搜一个会漏。
+    const hay = `${m.filename || ''} ${m.relative_path || ''} ${m.rel_path || ''} `
+        + `${m.model_id || ''} ${m.source || ''}`.toLowerCase();
+    return hay.includes(kw);
+}
+
+function sortLocalModels(list) {
+    const { key, dir } = localSortSpec();
+    if (key === 'default') return list;   // 保持后端顺序：未完成缓存优先 + 修改时间倒序
+
+    const sign = dir === 'desc' ? -1 : 1;
+    const byName = (a, b) => String(a.filename || '').localeCompare(
+        String(b.filename || ''), 'zh-Hans-CN', { numeric: true, sensitivity: 'base' }
+    );
+    const rank = (map, v) => (map[v] === undefined ? 9 : map[v]);
+
+    const cmp = {
+        name: byName,
+        size: (a, b) => (a.size || 0) - (b.size || 0),
+        time: (a, b) => (a.modified || 0) - (b.modified || 0),
+        validity: (a, b) => rank(VALIDITY_RANK, a.validity) - rank(VALIDITY_RANK, b.validity) || byName(a, b),
+        status: (a, b) => rank(UPD_STATUS_RANK, effectiveLocalStatus(a))
+                         - rank(UPD_STATUS_RANK, effectiveLocalStatus(b)) || byName(a, b),
+        // 有来源记录的排前面（“未知来源”沉底），再按来源名排。
+        // ⚠️ 不要用 '~' 之类哨兵字符靠 localeCompare 压后 —— 各语言的排序规则
+        //    对符号与字母的相对次序并不一致，结果会随运行环境变。
+        source: (a, b) => ((a.source ? 0 : 1) - (b.source ? 0 : 1))
+                          || String(a.source || '').localeCompare(String(b.source || ''))
+                          || byName(a, b),
+    }[key];
+
+    if (!cmp) return list;
+    return list.slice().sort((a, b) => cmp(a, b) * sign);
+}
+
+/** 应用过滤 + 排序，返回要渲染的那一批。 */
+function applyLocalView(models) {
+    return sortLocalModels((models || []).filter(matchesLocalFilter));
+}
+
+function localModifiedHtml(m) {
+    if (m.modified_human) return escapeHtml(m.modified_human);
+    if (!m.modified) return '';
+    return escapeHtml(new Date(m.modified * 1000).toLocaleString());
+}
+
+/** 表头排序箭头 */
+function sortArrow(key) {
+    const { key: k, dir } = localSortSpec();
+    if (k !== key) return '';
+    return `<span class="sort-arrow">${dir === 'desc' ? '▼' : '▲'}</span>`;
+}
+
+function thHtml(key, label) {
+    const active = localSortSpec().key === key;
+    return `<th class="sortable${active ? ' sorted' : ''}" data-sort="${key}"
+                title="点击按${label}排序">${label}${sortArrow(key)}</th>`;
+}
+
+function setLocalSort(key, dir) {
+    const sel = document.getElementById('local-sort');
+    if (!sel) return;
+    const v = `${key}-${dir}`;
+    const exists = Array.from(sel.options).some(o => o.value === v);
+    sel.value = exists ? v : key;
+    rerenderLocalList();
+}
+
+function updateLocalViewCount() {
+    const el = document.getElementById('local-view-count');
+    if (!el) return;
+    if (!localScanned || !localModels.length) {
+        el.textContent = '';
+        return;
+    }
+    const shown = applyLocalView(localModels).length;
+    el.textContent = shown === localModels.length
+        ? `共 ${localModels.length} 个文件`
+        : `显示 ${shown} / ${localModels.length} 个文件`;
+}
+
+/** 用当前数据重画列表（不重新扫盘），过滤/排序变化时调用。 */
+function rerenderLocalList() {
+    if (!localScanned) return;
+    renderLocalModels(localModels, document.getElementById('local-results'), lastScanDir);
+}
 
 async function loadLocalModels() {
     // ⭐ 扫描路径已移到设置里，这里读配置值，不再有页面输入框
@@ -834,84 +1045,145 @@ async function loadLocalModels() {
         }
         localModels = data.models || [];
         lastScanDir = data.scan_dir || '';
+        localScanned = true;
         renderLocalModels(localModels, container, lastScanDir);
     } catch (e) {
         container.innerHTML = `<p class="error">扫描失败: ${escapeHtml(e.message)}</p>`;
     }
 }
 
-function renderLocalModels(models, container, scanDir) {
-    if (!models || !models.length) {
-        container.innerHTML = `<p class="empty">在 ${escapeHtml(scanDir || '默认目录')} 未找到本地模型</p>`;
-        updateSelectionUI();
-        return;
-    }
-
+function localSummaryHtml(models, scanDir) {
     const total = models.reduce((s, m) => s + (m.size || 0), 0);
     const upgradable = models.filter(m => m.has_update_info).length;
-
-    container.innerHTML = `
+    const parts = models.filter(m => m.is_part);
+    const partHtml = parts.length
+        ? ` · <span class="warn-inline">${parts.length} 个未完成缓存占用 `
+          + `${escapeHtml(formatSize(parts.reduce((a, b) => a + (b.size || 0), 0)))}</span>`
+        : '';
+    return `
         <p class="scan-summary">
             扫描目录: ${escapeHtml(scanDir)} · 共 ${models.length} 个文件 ·
             占用 ${escapeHtml(formatSize(total))} · ${upgradable} 个可检测更新
-            ${(() => {
-                const parts = models.filter(m => m.is_part);
-                if (!parts.length) return '';
-                const bytes = parts.reduce((a, b) => a + (b.size || 0), 0);
-                return ` · <span class="warn-inline">${parts.length} 个未完成缓存占用 ${escapeHtml(formatSize(bytes))}</span>`;
-            })()}
+            ${partHtml}
+            <span class="summary-hint">（点表头可排序）</span>
         </p>
-        <table class="model-table">
-            <thead>
-                <tr>
-                    <th class="col-check"></th>
-                    <th>文件名</th>
-                    <th>大小</th>
-                    <th>有效性</th>
-                    <th>来源</th>
-                    <th>更新状态</th>
-                    <th>相对路径</th>
-                    <th class="col-ops">操作</th>
-                </tr>
-            </thead>
-            <tbody>
-                ${models.map((m, i) => `
-                    <tr data-path="${escapeHtml(m.path)}" data-rel="${escapeHtml(m.relative_path)}"
-                        class="${m.is_part ? 'row-part' : ''}">
-                        <td class="col-check">
-                            <input type="checkbox" class="row-check" data-path="${escapeHtml(m.path)}"
-                                   data-rel="${escapeHtml(m.relative_path)}"
-                                   aria-label="选择 ${escapeHtml(m.filename)}">
-                        </td>
-                        <td>${escapeHtml(m.filename)}</td>
-                        <td class="nowrap">${escapeHtml(m.size_human)}</td>
-                        <td>${validityBadgeHtml(m)}</td>
-                        <td class="source-cell">
-                            ${m.has_update_info
-                                ? `<span class="src-badge">${escapeHtml(m.source || '')}</span>
-                                   <span class="src-id" title="${escapeHtml(m.model_id || '')}">${escapeHtml(m.model_id || '')}</span>`
-                                : '<span class="src-none">未知来源</span>'}
-                        </td>
-                        <td class="status-cell" data-rel="${escapeHtml(m.relative_path)}">
-                            ${statusCellHtml(m)}
-                        </td>
-                        <td class="path-cell">${escapeHtml(m.relative_path)}</td>
-                        <td class="col-ops">
-                            <button class="op-btn check-one" data-rel="${escapeHtml(m.relative_path)}"
-                                    ${m.has_update_info ? '' : 'disabled title="无来源记录，无法检测"'}>检测</button>
-                            <button class="op-btn update-one" data-rel="${escapeHtml(m.relative_path)}"
-                                    ${m.has_update_info ? '' : 'disabled title="无来源记录，无法更新"'}>更新</button>
-                            <button class="delete-btn" data-path="${escapeHtml(m.path)}">删除</button>
-                        </td>
-                    </tr>
-                `).join('')}
-            </tbody>
-        </table>
+    `;
+}
+
+function renderLocalModels(models, container, scanDir) {
+    if (!container) return;
+
+    if (!models || !models.length) {
+        container.innerHTML = `<p class="empty">在 ${escapeHtml(scanDir || '默认目录')} 未找到本地模型</p>`;
+        updateSelectionUI();
+        updateLocalViewCount();
+        return;
+    }
+
+    const visible = applyLocalView(models);
+
+    const head = `
+        <thead>
+            <tr>
+                <th class="col-check"></th>
+                ${thHtml('name', '文件名')}
+                ${thHtml('size', '大小')}
+                ${thHtml('validity', '有效性')}
+                ${thHtml('source', '来源')}
+                ${thHtml('status', '更新状态')}
+                ${thHtml('time', '修改时间')}
+                <th>相对路径</th>
+                <th class="col-ops">操作</th>
+            </tr>
+        </thead>
     `;
 
+    // ⭐ 过滤后没有任何行：把工具栏留住（否则用户没办法清掉过滤条件）
+    const body = visible.length
+        ? `
+        <tbody>
+            ${visible.map(m => `
+                <tr data-path="${escapeHtml(m.path)}" data-rel="${escapeHtml(localRelKey(m))}"
+                    class="${m.is_part ? 'row-part' : ''}">
+                    <td class="col-check">
+                        <input type="checkbox" class="row-check" data-path="${escapeHtml(m.path)}"
+                               data-rel="${escapeHtml(localRelKey(m))}"
+                               ${selectedPaths.has(m.path) ? 'checked' : ''}
+                               aria-label="选择 ${escapeHtml(m.filename)}">
+                    </td>
+                    <td>${escapeHtml(m.filename)}</td>
+                    <td class="nowrap">${escapeHtml(m.size_human)}</td>
+                    <td>${validityBadgeHtml(m)}</td>
+                    <td class="source-cell">
+                        ${m.has_update_info
+                            ? `<span class="src-badge">${escapeHtml(m.source || '')}</span>
+                               <span class="src-id" title="${escapeHtml(m.model_id || '')}">${escapeHtml(m.model_id || '')}</span>`
+                            : '<span class="src-none">未知来源</span>'}
+                    </td>
+                    <td class="status-cell" data-rel="${escapeHtml(localRelKey(m))}">
+                        ${statusCellHtml(m)}
+                    </td>
+                    <td class="nowrap">${localModifiedHtml(m)}</td>
+                    <td class="path-cell">${escapeHtml(m.relative_path)}</td>
+                    <td class="col-ops">
+                        <button class="op-btn check-one" data-rel="${escapeHtml(localRelKey(m))}"
+                                ${m.has_update_info ? '' : 'disabled title="无来源记录，无法检测"'}>检测</button>
+                        <button class="op-btn update-one" data-rel="${escapeHtml(localRelKey(m))}"
+                                ${m.has_update_info ? '' : 'disabled title="无来源记录，无法更新"'}>更新</button>
+                        <button class="delete-btn" data-path="${escapeHtml(m.path)}">删除</button>
+                    </td>
+                </tr>
+            `).join('')}
+        </tbody>
+        `
+        : `<tbody><tr><td colspan="9" class="local-no-match">
+               没有符合当前过滤条件的模型（共 ${models.length} 个）
+           </td></tr></tbody>`;
+
+    container.innerHTML = localSummaryHtml(models, scanDir)
+        + `<table class="model-table">${head}${body}</table>`;
+
     bindLocalEvents(container);
+    bindSortHeaders(container);
     updateSelectionUI();
+    updateLocalViewCount();
 }
+
+/** 表头点击排序：同一列再点一次反向 */
+function bindSortHeaders(container) {
+    container.querySelectorAll('th.sortable').forEach(th => {
+        th.addEventListener('click', () => {
+            const key = th.dataset.sort;
+            const cur = localSortSpec();
+            let dir;
+            if (cur.key === key) {
+                dir = cur.dir === 'asc' ? 'desc' : 'asc';
+            } else {
+                // 体积/时间默认从大到小（用户更关心最大的、最新的）
+                dir = (key === 'size' || key === 'time') ? 'desc' : 'asc';
+            }
+            setLocalSort(key, dir);
+        });
+    });
+}
+
+// ---------- 工具栏事件 ----------
+(function bindLocalToolbar() {
+    const input = document.getElementById('local-filter-input');
+    const clearBtn = document.getElementById('local-filter-clear');
+    const statusSel = document.getElementById('local-filter-status');
+    const sortSel = document.getElementById('local-sort');
+
+    if (input) input.addEventListener('input', debounce(rerenderLocalList, 150));
+    if (clearBtn) {
+        clearBtn.addEventListener('click', () => {
+            if (input) input.value = '';
+            rerenderLocalList();
+        });
+    }
+    if (statusSel) statusSel.addEventListener('change', rerenderLocalList);
+    if (sortSel) sortSel.addEventListener('change', rerenderLocalList);
+})();
 
 /**
  * 有效性徽标。
@@ -957,7 +1229,7 @@ function statusCellHtml(m) {
     if (!m.has_update_info) {
         return '<span class="upd-badge unknown" title="手动放入的文件没有来源记录">—</span>';
     }
-    const cached = updateStatus.get(m.relative_path);
+    const cached = updateStatus.get(localRelKey(m));
     if (cached) return updateBadgeHtml(cached);
 
     const last = m.last_check_status;
@@ -1198,7 +1470,7 @@ document.getElementById('check-all-btn').addEventListener('click', async () => {
             body: JSON.stringify({ rel_paths: [] }),
         });
         const data = await res.json();
-        // v1.3.0：检测完成由事件流（check_completed）推送，这里只需把结果
+        // 检测完成由事件流（check_completed）推送，这里只需把结果
         // 灌进缓存即可，无需再整表重扫磁盘。
         (data.results || []).forEach(r => updateStatus.set(r.rel_path, r));
         refreshLocalBadgesOnly();
@@ -1211,7 +1483,7 @@ document.getElementById('check-all-btn').addEventListener('click', async () => {
 });
 
 document.getElementById('update-all-btn').addEventListener('click', async () => {
-    const rels = localModels.filter(m => m.has_update_info).map(m => m.relative_path);
+    const rels = localModels.filter(m => m.has_update_info).map(localRelKey);
     if (!rels.length) {
         toast('没有可更新的模型（需要有来源记录）', 'warning');
         return;
@@ -2034,7 +2306,7 @@ async function copyLogs() {
     }
 }
 
-// 级别下拉已移除；设置保存后由 settingsSaved 触发 renderAllLogs
+// 日志级别只在「设置 / 数据源与日志」里配置；保存后由 settingsSaved 触发 renderAllLogs
 document.getElementById('log-search').addEventListener('input', debounce(() => renderAllLogs(), 200));
 document.getElementById('log-search-clear').addEventListener('click', () => {
     document.getElementById('log-search').value = '';
@@ -2115,7 +2387,7 @@ function debounce(fn, wait) {
 }
 
 // ============================================================
-// 状态事件流（v1.3.0）
+// 状态事件流
 // ============================================================
 /**
  * 用 SSE（EventSource）订阅后端 /api/events，把“状态变化”从
@@ -2183,9 +2455,13 @@ function startEventStream() {
         applyTaskUpdated(d && d.task);
     });
 
-    es.addEventListener('config_changed', () => {
+    // ⚠️ 修复：旧回调写成 `() => { ... parseEventId(ev) ... }`，而 ev 从未在作用域里，
+    //    一进来就 ReferenceError，loadConfig() 根本没机会执行 ——
+    //    「设置保存后页面徽标不刷新」的根因就在这里。
+    es.addEventListener('config_changed', (ev) => {
         eventState.lastEventId = parseEventId(ev);
         loadConfig();                      // 重新拉配置，徽标/路径等跟着变
+        rerenderLocalList();               // 扫描路径可能刚改，过滤/排序视图重画
     });
 
     es.addEventListener('scheduler_tick', (ev) => {
@@ -2348,7 +2624,7 @@ async function refreshLocalStatusQuietly() {
 }
 
 function findLocalModelByRel(rel) {
-    return (localModels || []).find(m => m.relative_path === rel);
+    return (localModels || []).find(m => localRelKey(m) === rel);
 }
 
 // ============================================================
@@ -2357,5 +2633,5 @@ function findLocalModelByRel(rel) {
 (async function boot() {
     await loadConfig();          // 先拿配置（弹窗时长、版本、定期检测状态）
     refreshTasks();              // 恢复可能存在的下载任务面板
-    startEventStream();          // v1.3.0：开启状态事件流
+    startEventStream();          // 开启状态事件流
 })();

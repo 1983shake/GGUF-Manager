@@ -2,16 +2,15 @@
 下载任务管理器。
 
 设计要点：
-1) 之前用 FastAPI BackgroundTasks 启动下载，任务无状态、无进度、无法取消。
-   这里改为自管理的线程池 + 内存任务表，每个任务有独立状态机。
-2) 自己走 httpx 流式下载（而不是 hf_hub_download / snapshot_download），
-   因为 SDK 那两个函数不暴露进度回调，拿不到已下载字节数，
+1) 自管理的线程池 + 内存任务表，每个任务有独立状态机（有进度、可取消）。
+   不用 FastAPI BackgroundTasks：它起出来的任务无状态、无进度、无法取消。
+2) 自己走 httpx 流式下载（而不是 hf_hub_download / snapshot_download）：
+   那两个 SDK 函数不暴露进度回调，拿不到已下载字节数，
    自然也算不出速度和 ETA，更没法中途取消。
 3) 断点续传：先写 <name>.gguf.part，完成后 rename。
    取消时保留 .part，下次下载同一文件自动从断点继续。
 4) 速度用滑动窗口（默认 3 秒）计算，避免进度条抖动。
-5) v1.3.0：状态变化通过事件总线广播，前端据此实时更新任务行，
-   不再依赖 800ms 轮询。
+5) 状态变化通过事件总线广播，前端据此实时更新任务行，不依赖前端轮询。
 
 支持的两个源：
   HuggingFace   {endpoint}/{repo_id}/resolve/main/{filename}
@@ -31,9 +30,9 @@ from urllib.parse import quote
 import httpx
 
 from app.config import settings
-from app.logger import get_logger
-from app.models import human_size
 from app.events import emit_task_updated
+from app.logger import get_logger
+from app.utils import human_size
 
 logger = get_logger(__name__)
 
@@ -43,6 +42,12 @@ MAX_SAMPLES = 120
 CONNECT_TIMEOUT = 15.0
 READ_TIMEOUT = 60.0
 
+# 进度事件节流间隔（秒）。每收到一个 chunk 就广播一次的话，
+# 一个 5GB 的模型会产生 2 万条 SSE 帧 + 2 万次前端 DOM 重绘，
+# 纯属自我 DoS。0.4s 一次（约 2.5Hz）在体感上仍是“实时”，
+# 前端另有 800ms 兜底轮询，不会漏掉结束状态。
+PROGRESS_EMIT_INTERVAL = 0.4
+
 UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
@@ -51,17 +56,6 @@ UA = (
 
 class CancelledError(Exception):
     """任务被用户取消。"""
-
-
-def _get_source_backend(source: str):
-    """按 source 名取到对应后端实例（延迟 import 避免循环依赖）。"""
-    if source == "huggingface":
-        from app.sources import huggingface as hf
-        return hf.backend
-    if source == "modelscope":
-        from app.sources import modelscope as ms
-        return ms.backend
-    return None
 
 
 class DownloadTask:
@@ -92,6 +86,7 @@ class DownloadTask:
         self._cancel = threading.Event()
         self._lock = threading.Lock()
         self._samples: deque = deque(maxlen=MAX_SAMPLES)
+        self._last_progress_emit = 0.0
         self._thread: Optional[threading.Thread] = None
         self.llamacpp_reload: Optional[Dict] = None
         self.remote_last_modified: str = ""
@@ -264,8 +259,11 @@ class DownloadTask:
                                 continue
                             f.write(chunk)
                             self._add_bytes(len(chunk))
-                            # 下载中持续广播，让前端进度条实时推进
-                            emit_task_updated(self)
+                            # 下载中节流广播，让前端进度条实时推进（见 PROGRESS_EMIT_INTERVAL）
+                            now = time.time()
+                            if now - self._last_progress_emit >= PROGRESS_EMIT_INTERVAL:
+                                self._last_progress_emit = now
+                                emit_task_updated(self)
 
             os.replace(self.part_path, self.final_path)
             self.status = "completed"
@@ -294,7 +292,7 @@ class DownloadTask:
     def _record_registry(self) -> None:
         """把来源信息写进注册表，之后才能判断远端是否有更新。"""
         try:
-            from app.sources.registry import registry, rel_path_of
+            from app.sources.local import registry, rel_path_of
 
             rel = rel_path_of(str(self.final_path))
             if not rel:

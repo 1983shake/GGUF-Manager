@@ -15,12 +15,18 @@ GET /api/events 用 SSE（Server-Sent Events）把事件推给浏览器，
 为什么用 SSE 而不是 WebSocket：
   单向推送就够用，SSE 基于 HTTP、自带断线重连、穿过反代不用额外配置，
   实现成本远低于 WebSocket，浏览器 API 也更简单（EventSource）。
+
+订阅模型是「注册回调 add_listener()」：每个连接只登记一个回调，
+  事件产生时用 loop.call_soon_threadsafe 投递到该连接的事件循环，
+  断开时在 finally 里摘除。连接本身不带任何常驻线程，开销与连接数无关 ——
+  不要退回“每连接一个队列 + 一个搬运线程”的写法：连接一多线程数就成倍增长。
 """
 
 import json
+import threading
 import time
 from collections import deque
-from typing import Any, Deque, Dict, Optional
+from typing import Any, Callable, Deque, Dict, Optional
 
 from app.logger import get_logger
 
@@ -29,49 +35,55 @@ logger = get_logger(__name__)
 # 保留最近 N 条事件，用于新连接的客户端补回放（避免连接抖动期间丢事件）
 _BACKLOG_SIZE = 200
 
+Listener = Callable[[Dict[str, Any]], None]
+
 
 class EventBus:
-    """进程内的发布/订阅总线。线程安全，单监听器队列。"""
+    """进程内的发布/订阅总线。线程安全。"""
 
     def __init__(self, backlog: int = _BACKLOG_SIZE):
         self._backlog: Deque[Dict[str, Any]] = deque(maxlen=backlog)
-        self._subscribers: list = []
+        self._listeners: list = []
+        self._lock = threading.RLock()
         self._seq = 0
 
     def publish(self, name: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """发布事件，返回完整事件对象（便于同步调用方直接拿到）。"""
-        self._seq += 1
-        event = {
-            "id": self._seq,
-            "event": name,
-            "data": payload or {},
-            "ts": time.time(),
-        }
-        self._backlog.append(event)
-        for q in list(self._subscribers):
+        with self._lock:
+            self._seq += 1
+            event = {
+                "id": self._seq,
+                "event": name,
+                "data": payload or {},
+                "ts": time.time(),
+            }
+            self._backlog.append(event)
+            listeners = list(self._listeners)
+
+        # 回调在锁外执行：订阅者（SSE 连接）出问题不能拖垮发布方
+        for fn in listeners:
             try:
-                q.append(event)
-            except Exception:
-                pass
+                fn(event)
+            except Exception as e:  # noqa: BLE001 - 单个订阅者异常必须隔离
+                logger.debug(f"[events] listener failed: {e}")
         return event
 
     def history(self, since_id: int = 0) -> list:
         """返回 id 大于 since_id 的事件（供新连接做补回放）。"""
-        return [e for e in self._backlog if e["id"] > since_id]
+        with self._lock:
+            return [e for e in self._backlog if e["id"] > since_id]
 
-    def subscribe(self):
-        """生成一个新队列并注册；返回该队列（迭代器）。"""
-        from collections import deque as _deque
+    def add_listener(self, fn: Listener) -> None:
+        with self._lock:
+            if fn not in self._listeners:
+                self._listeners.append(fn)
 
-        q = _deque()
-        self._subscribers.append(q)
-        return q
-
-    def unsubscribe(self, q) -> None:
-        try:
-            self._subscribers.remove(q)
-        except ValueError:
-            pass
+    def remove_listener(self, fn: Listener) -> None:
+        with self._lock:
+            try:
+                self._listeners.remove(fn)
+            except ValueError:
+                pass
 
 
 bus = EventBus()

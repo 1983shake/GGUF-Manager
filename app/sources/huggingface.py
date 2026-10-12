@@ -1,15 +1,15 @@
 """
 HuggingFace 源后端。
 
-修复要点（v1.3.0）：
+设计要点：
 1) 超时/重试统一从配置读取，默认连接 15s / 读 60s。国内镜像普遍慢，10 秒必超时。
 2) 指数退避 + 总预算（deadline）：降级链每档都重试满 N 次的话，
    最坏要等 9 × 读超时，用绝对时间戳兜底。
 3) 搜索分级降级：full=True 大候选 → full=True 小候选 → full=False 服务端过滤。
-   最后一步响应极小，体积交给前端 /size 懒加载补齐。
+   最后一步响应极小，体积交给前端调 /api/search/sizes 批量补全。
 4) 实现 SourceBackend 协议，对外只暴露统一方法。
 
-⚠️ 顶部硬编码 HF_HUB_ETAG_TIMEOUT=10 是 10 秒读超时的直接来源，已移除。
+⚠️ 不要把 HF_HUB_ETAG_TIMEOUT 硬编码成 10 —— 那正是 10 秒读超时的来源。
 """
 
 import os
@@ -25,10 +25,16 @@ from huggingface_hub import HfApi, configure_http_backend  # noqa: E402
 
 from app.config import settings  # noqa: E402
 from app.logger import get_logger  # noqa: E402
-from app.models import sum_sizes, coerce_timestamp  # noqa: E402
-from app.sources.base import SourceBackend  # noqa: E402
+from app.sources import SourceBackend, TTLCache, normalize_model_card  # noqa: E402
+from app.utils import coerce_timestamp, sum_sizes  # noqa: E402
 
 logger = get_logger(__name__)
+
+
+# 文件列表缓存。定义在模块级（而不是类属性）是因为 apply_endpoint() 在类定义
+# 之前就要用到它 —— 切换镜像后必须清空，否则会拿到上一个端点缓存下来的结果。
+# 场景：搜索补全体积和「查看」文件列表查的是同一个模型，一次交互里会重复两三次。
+_FILES_CACHE = TTLCache(ttl=60.0, maxsize=512)
 
 
 # ============================================================
@@ -90,6 +96,9 @@ def apply_endpoint(endpoint: str = "") -> str:
         api.endpoint = base
     except Exception as e:
         logger.warning(f"[HF] cannot patch HfApi instance: {e}")
+
+    # 换了端点，旧缓存里的文件列表/大小都不再可信
+    _FILES_CACHE.clear()
 
     logger.info(f"[HF] endpoint -> {base} (api.endpoint={getattr(api, 'endpoint', '?')})")
     return endpoint
@@ -174,8 +183,6 @@ def _gguf_total_from_meta(model) -> Optional[int]:
 
 def _collect(iterator, limit: int, gguf_only: bool) -> List[Dict]:
     """把 list_models 的迭代器收敛成统一结构的列表。"""
-    from app.sources.base import normalize_model_card
-
     results: List[Dict] = []
     scanned = 0
 
@@ -242,7 +249,9 @@ class HuggingFaceBackend(SourceBackend):
             f"limit={limit}, endpoint={effective_endpoint()}"
         )
 
-        budget = float(getattr(settings, "hf_search_budget", 45) or 45)
+        # max(5, ...)：配置被写坏（0/负数）时也不会让 deadline 落在过去，
+        # 否则第 1 档就直接 break，最后 `raise None` 会变成 TypeError。
+        budget = max(5.0, float(getattr(settings, "hf_search_budget", 45) or 45))
         deadline = time.time() + budget
 
         plans = [
@@ -285,24 +294,34 @@ class HuggingFaceBackend(SourceBackend):
                     logger.info(f"[HF] degrading to plan {idx + 1}")
 
         logger.error(f"[HF] all plans failed: endpoint={effective_endpoint()}, err={last_err}")
+        if last_err is None:
+            raise RuntimeError(f"搜索未执行（时间预算 {budget:.0f}s 已耗尽）")
         raise last_err
 
     def get_model_size(self, model_id: str, deadline: Optional[float] = None) -> Dict:
-        """查单模型 GGUF 总大小（前端懒加载兜底）。"""
-        logger.info(f"[HF] get_model_size: model_id={model_id!r}")
-        info = _call_with_retry(
-            api.model_info, model_id, files_metadata=True, deadline=deadline
-        )
-        files = [
-            (s.rfilename, getattr(s, "size", None))
-            for s in (info.siblings or [])
-            if getattr(s, "rfilename", None) and s.rfilename.endswith(".gguf")
-        ]
-        return {"gguf_count": len(files), "total_size": sum_sizes(size for _, size in files)}
+        """
+        查单模型 GGUF 总大小（前端懒加载兜底）。
+
+        直接复用 get_gguf_files：两者统计的是同一批 .gguf 文件，
+        合流后既省一次 api.model_info，也共享同一份缓存。
+        """
+        logger.debug(f"[HF] get_model_size: model_id={model_id!r}")
+        files = self.get_gguf_files(model_id, deadline=deadline)
+        return {"gguf_count": len(files), "total_size": sum_sizes(f.get("size") for f in files)}
 
     def get_gguf_files(self, model_id: str, deadline: Optional[float] = None) -> List[Dict]:
-        """列出仓库内 GGUF 文件（含大小/修改时间/内容指纹）。"""
-        logger.info(f"[HF] get_gguf_files: model_id={model_id!r}")
+        """
+        列出仓库内 GGUF 文件（含大小/修改时间/内容指纹）。
+
+        带 60s TTL 缓存：搜索补全体积与「查看」文件列表会查同一个模型，
+        没必要重复走一遍 api.model_info。
+        """
+        cached, hit = _FILES_CACHE.get(model_id)
+        if hit:
+            logger.debug(f"[HF] get_gguf_files: cache hit, {len(cached)} files")
+            return cached
+
+        logger.debug(f"[HF] get_gguf_files: model_id={model_id!r}")
         info = _call_with_retry(
             api.model_info, model_id, files_metadata=True, deadline=deadline
         )
@@ -319,7 +338,8 @@ class HuggingFaceBackend(SourceBackend):
                 "etag": str(getattr(s, "blob_id", "") or ""),
             })
         gguf_files.sort(key=lambda x: x["filename"])
-        logger.info(f"[HF] get_gguf_files: found {len(gguf_files)} files")
+        logger.debug(f"[HF] get_gguf_files: found {len(gguf_files)} files")
+        _FILES_CACHE.set(model_id, gguf_files)
         return gguf_files
 
     def get_file_meta(self, model_id: str, filename: str) -> Dict:
