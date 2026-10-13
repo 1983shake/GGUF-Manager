@@ -68,7 +68,8 @@ def _startup() -> None:
     )
     logger.info(
         f"  UPDATE CHECK     = enabled={settings.update_check_enabled} "
-        f"every {settings.update_check_interval_minutes} min"
+        f"every {settings.update_check_interval_minutes} min "
+        f"source={settings.update_check_source}"
     )
     logger.info(f"  TIMEZONE         = {get_timezone_name()}")
     logger.info("=" * 62)

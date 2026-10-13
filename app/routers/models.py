@@ -29,6 +29,7 @@ from app.sources.local import (
     clear_cache,
     delete_model,
     registry,
+    resolve_update_source,
     scan_models,
     scheduler,
 )
@@ -237,12 +238,16 @@ def update_models(req: PathsRequest):
             continue
 
         try:
+            # 与更新检测保持同一套源解析：设置里强制了检测源（且该源上
+            # 确实有该文件）时，更新就从那个源重新下载，避免“检测说有
+            # 更新、下载却打去了另一个源”
+            source = resolve_update_source(rec)
             task = manager.start(
                 model_id=rec.get("model_id", ""),
                 filename=rec.get("filename", ""),
-                source=rec.get("source", "huggingface"),
+                source=source,
                 target_dir=str(settings.MODEL_DIR),
-                token=settings.hf_token if rec.get("source") == "huggingface" else "",
+                token=settings.hf_token if source == "huggingface" else "",
             )
             started.append({"rel_path": rel, "task_id": task.id, "status": task.status})
         except Exception as e:

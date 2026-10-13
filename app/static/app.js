@@ -1506,6 +1506,13 @@ document.getElementById('update-all-btn').addEventListener('click', async () => 
     }
 });
 
+// 检测源取值 → 徽标/提示文案（与设置面板下拉框、后端 UPDATE_CHECK_SOURCES 对应）
+const UPDATE_SOURCE_LABELS = {
+    record: '按记录来源',
+    huggingface: 'HuggingFace',
+    modelscope: 'ModelScope',
+};
+
 async function renderScheduleBadge(sched) {
     const el = document.getElementById('schedule-badge');
     if (!el) return;
@@ -1517,16 +1524,18 @@ async function renderScheduleBadge(sched) {
             return;
         }
     }
+    // 旧版本接口不返回 source 时按默认值展示
+    const srcLabel = UPDATE_SOURCE_LABELS[sched.source] || UPDATE_SOURCE_LABELS.record;
     if (!sched.enabled) {
         el.textContent = '定期检测：未启用';
         el.className = 'schedule-badge off';
     } else {
-        el.textContent = `定期检测：每 ${sched.interval_minutes} 分钟`;
+        el.textContent = `定期检测：每 ${sched.interval_minutes} 分钟（${srcLabel}）`;
         el.className = 'schedule-badge on';
     }
-    el.title = sched.last_run_at
+    el.title = (sched.last_run_at
         ? `上次检测：${new Date(sched.last_run_at * 1000).toLocaleString()}`
-        : '尚未执行过定期检测';
+        : '尚未执行过定期检测') + `\n检测源：${srcLabel}`;
 }
 
 // ============================================================
@@ -1552,6 +1561,7 @@ const SETTING_FIELDS = {
 const SETTING_SELECTS = {
     'set-log-level': 'log_level',
     'set-llama-flavor': 'llamacpp_flavor',
+    'set-update-source': 'update_check_source',
 };
 
 // 需要从界面值转换回配置值的下拉（默认不转换）
@@ -1560,6 +1570,7 @@ const SETTING_SELECTS = {
 const SETTING_SELECT_CAST = {
     'set-log-level': v => String(v).toUpperCase(),
     'set-llama-flavor': v => String(v).toLowerCase(),
+    'set-update-source': v => String(v).toLowerCase(),
 };
 
 const SETTING_CHECKS = {

@@ -49,9 +49,13 @@ EDITABLE_KEYS = {
     "hf_token",
     "update_check_enabled",
     "update_check_interval_minutes",
+    "update_check_source",
 }
 
 _LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+
+# 更新检测允许选择的源：record = 按模型记录的下载来源（默认）
+UPDATE_CHECK_SOURCES = {"record", "huggingface", "modelscope"}
 
 DEFAULTS = {
     "hf_endpoint": "",
@@ -76,6 +80,7 @@ DEFAULTS = {
     "llamacpp_reload_on_download": False,
     "update_check_enabled": True,
     "update_check_interval_minutes": 1440,
+    "update_check_source": "record",
 }
 
 REGISTRY_FILENAME = "registry.json"
@@ -113,6 +118,11 @@ def _coerce(key: str, value: Any) -> Any:
     if key == "log_level":
         v = str(value).upper()
         return v if v in _LOG_LEVELS else "INFO"
+    if key == "update_check_source":
+        # 脏数据（环境变量写错、settings.json 被手改）不能把检测打挂，
+        # 一律回退到默认的"按记录来源"
+        v = str(value or "").strip().lower()
+        return v if v in UPDATE_CHECK_SOURCES else "record"
     return value
 
 

@@ -421,12 +421,67 @@ def clear_cache(model_dir: str) -> Dict:
 # ============================================================
 # 更新检测
 # ============================================================
+def _check_source_candidates(record: dict) -> List[str]:
+    """
+    按设置里的「检测源」给出候选源顺序（去重、保序）。
+
+    · record（默认）：只用模型记录里的下载来源；
+    · huggingface / modelscope：强制源排最前，记录来源兜底——
+      大量模型只在一个源上有，不回退会把“这个源没有”误判成
+      “远端已无此文件”。
+    """
+    recorded = (record.get("source") or "").strip()
+    preferred = str(settings.update_check_source or "record").strip().lower()
+
+    candidates: List[str] = []
+    if preferred in ("huggingface", "modelscope"):
+        candidates.append(preferred)
+    if recorded and recorded not in candidates:
+        candidates.append(recorded)
+    return candidates
+
+
+def resolve_update_source(record: dict) -> str:
+    """
+    解析「更新下载」实际使用的源，与 _remote_meta 的口径保持一致：
+    强制源上没有该文件时回退记录来源，避免重新下载打过去 404。
+
+    检测刚跑过时上游文件列表还在 60s TTL 缓存里，这次确认基本不花钱。
+    """
+    candidates = _check_source_candidates(record)
+    if not candidates:
+        return "huggingface"
+    if len(candidates) == 1:
+        return candidates[0]
+
+    model_id = record.get("model_id", "")
+    filename = record.get("filename", "")
+    if not model_id or not filename:
+        return candidates[0]
+    for src in candidates:
+        backend = get_backend(src)
+        if backend is None:
+            continue
+        try:
+            meta = backend.get_file_meta(model_id, filename)
+        except Exception:
+            continue
+        if meta.get("size") is not None:
+            return src
+    # 所有源都查不到该文件：按优先级用第一个，让下载方报明确的 404，
+    # 好过静默换源下一个“同名但内容不同”的文件
+    return candidates[0]
+
+
 def _remote_meta(record: dict) -> Dict:
     """
     查远端该文件的当前元信息（大小 / 修改时间 / 内容标识）。
 
     只用大小判断不够：仓库重新量化或修了权重后体积可能完全一致，
     只比 size 会漏报更新。这里三个维度一起取，任一维变化即判为“有更新”。
+
+    查询源由 _check_source_candidates 决定：默认按记录来源；设置里强制
+    某个源时优先查它，查不到再回退记录来源。
     """
     empty = {"size": None, "mtime": None, "etag": ""}
     model_id = record.get("model_id", "")
@@ -434,11 +489,32 @@ def _remote_meta(record: dict) -> Dict:
     if not model_id or not filename:
         return empty
 
-    backend = get_backend(record.get("source", ""))
-    if backend is None:
+    candidates = _check_source_candidates(record)
+    if not candidates:
         return empty
 
-    return backend.get_file_meta(model_id, filename)
+    last_error: Optional[Exception] = None
+    answered = False  # 是否有源明确返回“没有这个文件”（区别于网络异常）
+    for src in candidates:
+        backend = get_backend(src)
+        if backend is None:
+            continue
+        try:
+            meta = backend.get_file_meta(model_id, filename)
+        except Exception as e:
+            # 网络/超时类错误：先记下，尝试回退到下一个源
+            last_error = e
+            logger.debug(f"[updater] {src} lookup failed for {model_id}/{filename}: {e}")
+            continue
+        if meta.get("size") is not None:
+            return meta
+        answered = True
+
+    if last_error is not None and not answered:
+        # 全是异常（网络不通/超时），不是“文件不存在”：
+        # 抛出去让 check_one 报“查询远端失败”，避免误报“远端已无此文件”
+        raise last_error
+    return empty
 
 
 def _failed(rel_path: str, base: Dict, message: str) -> Dict:
@@ -623,6 +699,7 @@ class UpdateScheduler:
         return {
             "enabled": bool(settings.update_check_enabled),
             "interval_minutes": int(settings.update_check_interval_minutes or 0),
+            "source": str(settings.update_check_source or "record"),
             "running": self.running,
             "last_run_at": self.last_run_at,
             "last_summary": self.last_summary,

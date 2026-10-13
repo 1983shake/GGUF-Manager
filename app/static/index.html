@@ -376,6 +376,19 @@
                         <span class="setting-label">检测间隔（分钟）</span>
                         <input type="number" id="set-update-interval" min="10" max="10080" step="10">
                     </label>
+                    <label class="setting-row">
+                        <span class="setting-label">检测源</span>
+                        <select id="set-update-source">
+                            <option value="record">按模型记录的下载来源（推荐）</option>
+                            <option value="huggingface">HuggingFace（含镜像）</option>
+                            <option value="modelscope">ModelScope</option>
+                        </select>
+                        <span class="setting-hint">
+                            默认回到每个模型的下载来源查询。国内访问 HuggingFace
+                            不稳定时可强制走 ModelScope；强制源上没有该文件时，
+                            会自动回退到记录来源，不会误判为“远端已无此文件”
+                        </span>
+                    </label>
                 </fieldset>
             </div>
 
@@ -417,6 +430,6 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=27"></script>
+    <script src="/static/app.js?v=28"></script>
 </body>
 </html>

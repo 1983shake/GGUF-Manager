@@ -71,3 +71,6 @@ desktop.ini
 
 # ---------------- Docker ----------------
 docker-compose.override.yml
+
+# ---------------- AI工作空间 ----------------
+.workbuddy
