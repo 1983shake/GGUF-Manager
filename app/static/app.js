@@ -533,6 +533,9 @@ let countdownTimer = null;   // 倒计时文字刷新
 // 首次 /api/tasks 拉取完成后才"武装"：此后 SSE 任务事件才可以影响面板显隐。
 // 武装前（页面刚打开、轮询还在途中）收到的事件必然是连接后新产生的，照常处理。
 let taskEventsArmed = false;
+// 已弹过“结束”通知的任务 id：SSE 与轮询两条通道共用，避免同一条任务的
+// 结束通知（下载完成/失败/取消）弹两次
+const finishedToastSent = new Set();
 
 function taskPanelEl() { return document.getElementById('task-panel'); }
 
@@ -609,21 +612,14 @@ async function refreshTasks() {
         window.__lastTasks = tasks;
         window.__prevTasks = prev.slice();
 
-        // 任务刚结束 → 提示一次
+        // 任务刚结束 → 提示一次（SSE 与轮询两条通道共用 finishedToastSent 去重，
+        // 一条任务结束会同时被 SSE 事件与轮询快照检出，不去重会弹两次“下载完成”）
         prev.forEach(old => {
             if (old.status !== 'downloading' && old.status !== 'pending') return;
             const now = tasks.find(t => t.id === old.id);
             if (!now) return;
-            if (now.status === 'completed') {
-                toast(`下载完成：${now.filename}`, 'success');
-                // 本地管理页开着的话刷新一下
-                if (document.getElementById('tab-local').classList.contains('active')) {
-                    loadLocalModels();
-                }
-            } else if (now.status === 'error') {
-                toast(`下载失败：${now.filename}（${now.error || '未知错误'}）`, 'error');
-            } else if (now.status === 'cancelled') {
-                toast(`已取消：${now.filename}`, 'info');
+            if (now.status === 'completed' || now.status === 'error' || now.status === 'cancelled') {
+                toastIfJustFinished(now);
             }
         });
 
@@ -796,6 +792,36 @@ function hideTaskPanel(opts) {
     }
 }
 
+// ⭐ 取消 / 移除按钮用事件委托绑定在列表容器上（只绑一次）。
+//    下载中面板每次进度变化都整表重绘 innerHTML，逐节点绑定的按钮在
+//    mousedown 与 mouseup 之间就可能被替换掉，click 事件随之丢失——
+//    用户点「取消」毫无反应（表现为"下载中无法取消"）。委托不受节点替换影响。
+//    精准更新路径（applyTaskUpdated 的 replaceWith）也一并覆盖。
+document.getElementById('task-list').addEventListener('click', async (e) => {
+    const cancelBtn = e.target.closest('.task-cancel');
+    if (cancelBtn) {
+        cancelBtn.disabled = true;
+        cancelBtn.textContent = '取消中';
+        try {
+            await fetch(`${API}/api/tasks/${cancelBtn.dataset.id}/cancel`, { method: 'POST' });
+            lastTaskSnapshot = '';
+            await refreshTasks();
+        } catch (err) {
+            cancelBtn.disabled = false;
+            cancelBtn.textContent = '取消';
+        }
+        return;
+    }
+    const removeBtn = e.target.closest('.task-remove');
+    if (removeBtn) {
+        try {
+            await fetch(`${API}/api/tasks/${removeBtn.dataset.id}`, { method: 'DELETE' });
+            lastTaskSnapshot = '';
+            await refreshTasks();
+        } catch (err) { /* 静默 */ }
+    }
+});
+
 function renderTasks(tasks) {
     const list = document.getElementById('task-list');
 
@@ -806,31 +832,6 @@ function renderTasks(tasks) {
     lastTaskSnapshot = snapshot;
 
     list.innerHTML = tasks.map(t => taskCardHtml(t)).join('');
-
-    list.querySelectorAll('.task-cancel').forEach(btn => {
-        btn.addEventListener('click', async () => {
-            btn.disabled = true;
-            btn.textContent = '取消中';
-            try {
-                await fetch(`${API}/api/tasks/${btn.dataset.id}/cancel`, { method: 'POST' });
-                lastTaskSnapshot = '';
-                await refreshTasks();
-            } catch (e) {
-                btn.disabled = false;
-                btn.textContent = '取消';
-            }
-        });
-    });
-
-    list.querySelectorAll('.task-remove').forEach(btn => {
-        btn.addEventListener('click', async () => {
-            try {
-                await fetch(`${API}/api/tasks/${btn.dataset.id}`, { method: 'DELETE' });
-                lastTaskSnapshot = '';
-                await refreshTasks();
-            } catch (e) { /* 静默 */ }
-        });
-    });
 
     const active = tasks.filter(t => t.status === 'pending' || t.status === 'downloading').length;
     // 面板顶部不放标题文字：任务数量与状态由卡片和徽标表达即可
@@ -2557,15 +2558,37 @@ function applyModelUpdated(d) {
     refreshLocalStatusQuietly();
 }
 
+/**
+ * 任务刚结束（completed / error / cancelled）时弹一条通知，并用 finishedToastSent
+ * 去重。SSE 事件与 800ms 轮询是两条独立通道，同一条任务的结束会同时被两者检出，
+ * 不去重就会弹两次“下载完成”。调用方需先确认这是“本会话内刚结束”的任务
+ * （wasRunning），历史 / 重连回放已结束事件不弹。
+ */
+function toastIfJustFinished(task) {
+    const id = String(task.id);
+    if (finishedToastSent.has(id)) return;
+    finishedToastSent.add(id);
+    if (task.status === 'completed') {
+        toast(`下载完成：${task.filename}`, 'success');
+        if (document.getElementById('tab-local').classList.contains('active')) {
+            loadLocalModels();
+        }
+    } else if (task.status === 'error') {
+        toast(`下载失败：${task.filename}（${task.error || '未知错误'}）`, 'error');
+    } else if (task.status === 'cancelled') {
+        toast(`已取消：${task.filename}`, 'info');
+    }
+}
+
 function applyTaskUpdated(task) {
     if (!task) return;
 
     const finished = task.status !== 'pending' && task.status !== 'downloading';
 
     // ⭐ 幽灵过滤：SSE 断线重连时会补回放断线期间错过的事件，其中可能躺着
-    //    早已结束任务的"下载中"进度事件（下载中以 0.4s 节流广播，一次下载能
+    //    早已结束任务的“下载中”进度事件（下载中以 0.4s 节流广播，一次下载能
     //    留下几十上百条）。轮询 /api/tasks 拿到的才是任务列表的真相：武装后，
-    //    真相里不存在的"进行中"任务是历史幽灵——原样处理会弹出任务面板、
+    //    真相里不存在的“进行中”任务是历史幽灵——原样处理会弹出任务面板、
     //    插一个永远不会结束的下载中卡片（刷新页面最常见的复现路径）。
     //    武装前不过滤：那时收到的事件必然是连接后新产生的。
     if (!finished && taskEventsArmed) {
@@ -2578,16 +2601,16 @@ function applyTaskUpdated(task) {
     //    以及本页面内刚结束的实时事件。对它们无脑 showTaskPanel() 并塞进
     //    __lastTasks，会让刷新页面都弹出任务面板（一直显示到自动收起倒计时
     //    走完）。服务端 /api/tasks 才是任务列表的真相，轮询一到就会用真实
-    //    数据覆盖，回放的历史事件只是"幽灵"。
+    //    数据覆盖，回放的历史事件只是“幽灵”。
     if (finished) {
-        // 先用旧快照判断这条是否"刚结束"（回放的历史事件不在快照里，不会误弹）
+        // 先判断这条是否“本会话内刚结束”：只有曾在快照里处于进行中/排队的任务
+        // 才弹通知，回放的历史已结束事件（刷新页面 / SSE 重连补回放）不会误弹。
         const oldPrev = window.__prevTasks || [];
         const oldOne = oldPrev.find(t => t.id === task.id);
-        const justFinished = !!oldOne
+        const wasRunning = !!oldOne
             && (oldOne.status === 'pending' || oldOne.status === 'downloading');
 
-        // 再维护 __prevTasks：让随后的轮询知道这条已提示过，避免重复弹
-        // "下载完成"通知（轮询与 SSE 是两条独立通道，都会走到 toast）。
+        // 维护 __prevTasks 快照（供后续事件判断，及非结束分支覆盖）
         const pi = oldPrev.findIndex(t => t.id === task.id);
         if (pi >= 0) {
             oldPrev[pi] = task;
@@ -2607,18 +2630,10 @@ function applyTaskUpdated(task) {
             lastTaskSnapshot = '';   // 下次轮询重绘以服务端数据为准
         }
 
-        if (justFinished) {
-            if (task.status === 'completed') {
-                toast(`下载完成：${task.filename}`, 'success');
-                // 本地管理页开着的话刷新一下
-                if (document.getElementById('tab-local').classList.contains('active')) {
-                    loadLocalModels();
-                }
-            } else if (task.status === 'error') {
-                toast(`下载失败：${task.filename}（${task.error || '未知错误'}）`, 'error');
-            } else if (task.status === 'cancelled') {
-                toast(`已取消：${task.filename}`, 'info');
-            }
+        // 刚结束才弹；SSE 与轮询两条通道共用 finishedToastSent 去重，
+        // 同一条任务的“下载完成/失败/取消”通知只会弹一次
+        if (wasRunning) {
+            toastIfJustFinished(task);
         }
         return;
     }
@@ -2639,22 +2654,8 @@ function applyTaskUpdated(task) {
     }
     window.__lastTasks = tasks;
 
-    // 如果这条任务刚结束，弹一条通知
-    const prev = window.__prevTasks || [];
-    window.__prevTasks = tasks.slice();
-    const oldOne = prev.find(t => t.id === task.id);
-    if (oldOne && (oldOne.status === 'pending' || oldOne.status === 'downloading')) {
-        if (task.status === 'completed') {
-            toast(`下载完成：${task.filename}`, 'success');
-            if (document.getElementById('tab-local').classList.contains('active')) {
-                loadLocalModels();
-            }
-        } else if (task.status === 'error') {
-            toast(`下载失败：${task.filename}（${task.error || '未知错误'}）`, 'error');
-        } else if (task.status === 'cancelled') {
-            toast(`已取消：${task.filename}`, 'info');
-        }
-    }
+    // ⭐ 这里是非结束分支（pending/downloading）：结束通知统一由上方 finished
+    //    分支的 toastIfJustFinished 处理（SSE 与轮询共用去重），不要在此再弹。
 
     // 精准更新：只重绘这条任务的卡片，不整表重渲
     const existing = list.querySelector(`.task-item[data-task-id="${cssEscape(String(task.id))}"]`);

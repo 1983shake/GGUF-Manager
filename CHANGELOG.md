@@ -7,6 +7,20 @@
 
 ---
 
+## [1.4.3] - 2026-10-19
+
+### 修复
+
+| 问题 | 影响 / 修复 |
+| ---- | ---- |
+| 更新检测“假更新”：有时亮“有更新”，手动再检测却变“已是最新” | 根因：`Registry.mark_checked()` 在**每次检测结束**时把远端当前 `remote_size / remote_mtime / remote_etag` 回写进注册表，覆盖了 `put()` 在下载时写入的“本地文件对应远端版本基线”。第一次检测出 `update_available` 后基线被刷成最新版，下次检测拿“新基线 vs 当前远端”自然判 `up_to_date`，本地其实仍是旧版，更新被“消费”一次后丢失。修复：`mark_checked()` 只更新 `last_checked_at / last_check_status`，**不再回写版本基线**；基线仅在 `put()`（下载/更新成功）时更新。同步去掉 `check_one()` 调用 `mark_checked` 时传入的 `remote_size / remote_mtime / remote_etag` 实参。`app/sources/local.py` |
+| 模型下载完成后“下载完成”通知弹两次（任务面板出现两条完成提示） | 根因：一条任务结束同时被两条独立通道检出——SSE `task_updated(completed)` 事件（`applyTaskUpdated` 的 finished 分支）与 800ms 轮询 `/api/tasks` 快照（`refreshTasks` 的完成检测），两者各自 `toast('下载完成')`，原去重只靠 `__prevTasks` 且轮询路径未读它。修复：抽公共 `toastIfJustFinished()`，用模块级 `finishedToastSent` 集合做 SSE 与轮询**共用**去重（同 id 只弹一次）；保留 `wasRunning` 判定（任务曾在快照里处于进行中/排队）确保刷新页面 / SSE 重连回放的“历史已结束”事件仍**不弹**。任务 id 为 `uuid4().hex[:12]`，每次下载唯一，不误伤重复下载。`app/static/app.js` |
+| 下载中点「取消」无反应，无法取消下载 | 根因：任务面板下载中每次进度变化整表重绘 `innerHTML`（≥800ms 一次），「取消 / 移除」按钮是**每次重绘后逐节点绑定** click——节点在 mousedown 与 mouseup 之间被替换，click 事件丢失。修复：改为**事件委托**，在 `#task-list` 容器上只绑一次（覆盖整表重绘与精准更新 `replaceWith` 两条替换路径），节点替换不再影响事件响应。`app/static/app.js` |
+| 更新下载完成（已转新版）后，手动检测仍恒报“有更新” | 根因：**版本基线与检测值不在同一命名空间**。下载落库（`_record_registry`）写的是 HTTP 响应头 `ETag` / `Last-Modified`，而检测（`check_one` → `get_file_meta`）比较的是来源 API 元数据（HF `blob_id` / `lastModified` 等）——两套标识永远不相等，`etag_changed` 恒真 → 刚下载完的最新版被恒定误报。修复：① 落库改为优先取**与检测同源的 API 元数据**作基线（`get_backend(source).get_file_meta()`），失败才回退 HTTP 头并标记 `remote_ns="http"`；② 注册表新增 `remote_ns` 字段，`check_one` 只在 `remote_ns=="api"` 时比 etag/mtime，旧数据（无标记）降级只比 size（字节数跨命名空间稳定），避免历史记录恒定误报；旧记录下次下载更新后自动升级为 api 基线。`app/sources/downloader.py`、`app/sources/local.py` |
+| 清理 `applyTaskUpdated` 死代码 toast 块 | 非结束分支（pending/downloading）内判断 completed/error/cancelled 并弹通知的代码块永远不可达（`finished` 已提前 return），删除以防误导后续维护，结束通知统一走 `toastIfJustFinished` 去重。`app/static/app.js` |
+
+---
+
 ## [1.4.2] - 2026-10-19
 
 ### 修复

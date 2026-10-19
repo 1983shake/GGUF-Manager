@@ -141,6 +141,7 @@ class Registry:
         remote_mtime: Optional[float] = None,
         remote_etag: str = "",
         just_downloaded: bool = True,
+        remote_ns: str = "api",
     ) -> None:
         """
         记录来源。
@@ -148,6 +149,11 @@ class Registry:
         just_downloaded=True（默认）表示刚下载/更新完成：
         内容此刻正是远端最新版本，直接标记为「已是最新」，
         而不是留空让界面显示“未检查”——用户还得手动点一次检测才变绿。
+
+        remote_ns 标记基线三字段（remote_size/remote_mtime/remote_etag）的取值
+        命名空间："api"=来源 API 元数据（与 check_one 的 _remote_meta 同源，
+        可全维度比较）；"http"=HTTP 响应头兜底值（与 API 元数据命名空间不同，
+        etag/mtime 不可比，检测时只比 size）。
         """
         self._ensure_loaded()
         now = time.time()
@@ -160,6 +166,7 @@ class Registry:
                 "remote_size": remote_size,
                 "remote_mtime": remote_mtime,
                 "remote_etag": remote_etag or "",
+                "remote_ns": remote_ns,
                 "local_size": local_size,
                 "downloaded_at": old.get("downloaded_at", now),
                 "updated_at": now,
@@ -180,15 +187,17 @@ class Registry:
             reason="download" if just_downloaded else "record",
         )
 
-    def mark_checked(
-        self,
-        rel_path: str,
-        status: str,
-        remote_size: Optional[int] = None,
-        remote_mtime: Optional[float] = None,
-        remote_etag: str = "",
-    ) -> None:
-        """检测完成后更新状态并广播事件。"""
+    def mark_checked(self, rel_path: str, status: str) -> None:
+        """检测完成后更新状态并广播事件。
+
+        ⚠️ 只更新「本次检测结果」(last_checked_at / last_check_status)，**绝不**
+        回写 remote_size / remote_mtime / remote_etag —— 这三个字段是「本地文件对应的
+        远端版本基线」，只在下载/更新时由 put() 写入一次。
+
+        之前这里会把远端当前值写回基线，导致：第一次检测出 update_available 后基线被
+        刷成最新版，下次检测拿「新基线 vs 当前远端」自然判定为已是最新，于是出现
+        “自动检测出更新，手动再检测却变最新版”的假消息（本地其实还是旧版本）。
+        """
         self._ensure_loaded()
         with self._lock:
             rec = self._data.get(rel_path)
@@ -196,12 +205,6 @@ class Registry:
                 return
             rec["last_checked_at"] = time.time()
             rec["last_check_status"] = status
-            if remote_size is not None:
-                rec["remote_size"] = remote_size
-            if remote_mtime is not None:
-                rec["remote_mtime"] = remote_mtime
-            if remote_etag:
-                rec["remote_etag"] = remote_etag
             self._save()
 
         emit_model_updated(rel_path, status=status, reason="check")
@@ -574,10 +577,20 @@ def check_one(rel_path: str, local_size: Optional[int] = None) -> Dict:
 
     # 多重维度判断“远端是否出了新版本”。
     # mtime 加 5 分钟容差，避免 CDN/镜像时间戳精度不一致导致误报；size 与 etag 是硬指标。
+    #
+    # ⚠️ etag/mtime 只在基线与当前值同一命名空间时才可比：
+    # 基线若是 HTTP 响应头的 ETag/Last-Modified（remote_ns != "api"，含 1.4.2-T002
+    # 之前的旧数据），与 API 元数据的 blob_id/lastModified 命名空间不同，永远对不上，
+    # 拿来比较会造成“刚下载完就报有更新”的恒定误报。此时降级为只比 size
+    # （字节数与命名空间无关）；旧记录在下次下载更新后自动升级为 api 基线。
+    ns_comparable = record.get("remote_ns", "") == "api"
     size_changed = recorded_size is not None and remote != recorded_size
-    etag_changed = bool(recorded_etag and remote_etag and remote_etag != recorded_etag)
+    etag_changed = bool(
+        ns_comparable and recorded_etag and remote_etag and remote_etag != recorded_etag
+    )
     mtime_changed = bool(
-        recorded_mtime and remote_mtime
+        ns_comparable
+        and recorded_mtime and remote_mtime
         and abs(float(remote_mtime) - float(recorded_mtime)) > MTIME_TOLERANCE
     )
 
@@ -609,10 +622,7 @@ def check_one(rel_path: str, local_size: Optional[int] = None) -> Dict:
             + "）"
         )
 
-    registry.mark_checked(
-        rel_path, status,
-        remote_size=remote, remote_mtime=remote_mtime, remote_etag=remote_etag,
-    )
+    registry.mark_checked(rel_path, status)
     return {**base, "status": status, "message": message}
 
 

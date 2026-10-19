@@ -293,20 +293,47 @@ class DownloadTask:
         """把来源信息写进注册表，之后才能判断远端是否有更新。"""
         try:
             from app.sources.local import registry, rel_path_of
+            from app.sources import get_backend
 
             rel = rel_path_of(str(self.final_path))
             if not rel:
                 logger.warning("[task] final path outside MODEL_DIR, skip registry")
                 return
+
+            # ⭐ 基线三字段必须与检测（check_one → get_file_meta，API 元数据）同一
+            #    命名空间，否则“刚下载完的最新版”也会因 etag/mtime 永远对不上而
+            #    被误报为有更新。优先取同源 API 元数据；失败才退回 HTTP 响应头，
+            #    并标记 remote_ns="http"（检测端对 http 基线只比 size）。
+            size: Optional[int] = None
+            mtime = None
+            etag = ""
+            ns = "http"
+            try:
+                backend = get_backend(self.source)
+                meta = backend.get_file_meta(self.model_id, self.filename) if backend else None
+                if meta and meta.get("size") is not None:
+                    size = meta.get("size")
+                    mtime = meta.get("mtime")
+                    etag = meta.get("etag") or ""
+                    ns = "api"
+            except Exception as e:
+                logger.debug(f"[task {self.id}] api meta lookup failed, fallback to http headers: {e}")
+
+            if ns != "api":
+                size = self.total_bytes or None
+                mtime = _parse_http_time(self.remote_last_modified)
+                etag = self.remote_etag
+
             registry.put(
                 rel_path=rel,
                 model_id=self.model_id,
                 source=self.source,
                 filename=self.filename,
-                remote_size=self.total_bytes or None,
+                remote_size=size,
                 local_size=self.downloaded_bytes,
-                remote_mtime=_parse_http_time(self.remote_last_modified),
-                remote_etag=self.remote_etag,
+                remote_mtime=mtime,
+                remote_etag=etag,
+                remote_ns=ns,
             )
         except Exception as e:
             logger.warning(f"[task] registry write failed: {e}")
