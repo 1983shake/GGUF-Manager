@@ -22,7 +22,7 @@ import os
 from typing import Any, Dict, Optional
 
 import httpx
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Header, Query
 from pydantic import BaseModel
 
 from app import __version__
@@ -285,13 +285,24 @@ async def llamacpp_proxy(path: str = Query(..., description="要代理的 llama.
 # SSE 事件流
 # ============================================================
 @router.get("/api/events")
-async def events_stream(last_event_id: int = Query(0, description="断线重连时传上次收到的最后事件 id")):
+async def events_stream(
+    last_event_id: int = Query(0, description="断线重连时传上次收到的最后事件 id"),
+    last_event_id_header: Optional[str] = Header(None, alias="Last-Event-ID"),
+):
     """
     状态变化实时推送（Server-Sent Events）。
 
-    前端用 EventSource 连接即可自动重连。连接建立时先回放 last_event_id
-    之后的历史事件，再持续推送新事件。这把原来“手动检测 + 定时轮询”的
-    模式改成了“被动接收”，更新状态不再需要手动触发。
+    前端用 EventSource 连接即可自动重连。断线重连时浏览器会自动带
+    `Last-Event-ID` **请求头**（注意不是 query 参数），这里两个来源都读，
+    取较大者作为回放起点，补上断线期间错过的事件，再持续推送新事件。
+    这把原来“手动检测 + 定时轮询”的模式改成了“被动接收”，更新状态不再需要手动触发。
+
+    ⭐ 首次连接（既没有 header 也没有 query 参数）**不回放历史 backlog**：
+    历史事件对“刚打开页面”的客户端是过去时——比如几分钟前一次下载的
+    几百条 `task_updated(downloading)` 进度事件，此时原样重放只会制造幽灵
+    （前端会据此弹出任务面板、显示一个早已结束的下载中卡片）。页面的现状
+    由前端启动时的全量拉取（/api/tasks、/api/config、/api/models）覆盖，
+    不需要、也不应该由回放来重建。
 
     实现要点：EventBus 的 publish 可能来自任意工作线程，
     直接把事件投进 asyncio.Queue 不安全，因此注册一个回调，
@@ -301,12 +312,20 @@ async def events_stream(last_event_id: int = Query(0, description="断线重连�
 
     from starlette.responses import StreamingResponse
 
+    resume_from = last_event_id
+    if last_event_id_header:
+        try:
+            resume_from = max(resume_from, int(last_event_id_header))
+        except (TypeError, ValueError):
+            pass  # 头格式异常时忽略，按无回放处理
+
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
 
-    # 先回放断线期间错过的事件
-    for ev in bus.history(since_id=last_event_id):
-        queue.put_nowait(ev)
+    # 仅断线重连（知道上次收到哪条）才补回放；首次连接从“现在”开始收
+    if resume_from > 0:
+        for ev in bus.history(since_id=resume_from):
+            queue.put_nowait(ev)
 
     def _sink(event: Dict[str, Any]) -> None:
         """由发布线程调用；必须在事件循环线程里入队。"""

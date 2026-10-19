@@ -530,6 +530,9 @@ let allFinishedAt = null;    // 所有任务结束的时刻，用于自动收起
 let autoHideDeadline = null; // 自动收起的绝对时间点，用于显示倒计时
 let autoHideTimer = null;    // 独立的 setTimeout，不依赖轮询
 let countdownTimer = null;   // 倒计时文字刷新
+// 首次 /api/tasks 拉取完成后才"武装"：此后 SSE 任务事件才可以影响面板显隐。
+// 武装前（页面刚打开、轮询还在途中）收到的事件必然是连接后新产生的，照常处理。
+let taskEventsArmed = false;
 
 function taskPanelEl() { return document.getElementById('task-panel'); }
 
@@ -561,11 +564,16 @@ document.getElementById('task-panel-toggle').addEventListener('click', () => {
     applyCollapse();
 });
 
-// ⭐ 手动关闭：立刻收起并停掉轮询，不必等自动收起
+// ⭐ 手动关闭：立刻收起并停掉轮询，不必等自动收起。
+//    clearTasks: true 一并清掉三样东西——本地任务缓存、服务端已结束的任务、
+//    以及面板里的通知。不清本地缓存的话，残留的 __lastTasks 会在通知消息
+//    到期回调 updatePanelVisibility() 时被误判成"服务端僵尸任务"，
+//    触发一次多余的服务端清理（且 × 的语义就是"不再关注这些任务"）。
+//    （clear_finished 不动进行中的任务，正在下载时点关闭是安全的。）
 document.getElementById('task-panel-close').addEventListener('click', (e) => {
     e.stopPropagation();
     stopTaskPolling();
-    hideTaskPanel();
+    hideTaskPanel({ clearTasks: true });
     renderNetSpeed(0, 0);
 });
 
@@ -576,12 +584,8 @@ document.getElementById('task-panel-close').addEventListener('click', (e) => {
 // 弹窗会常驻不消失。改为显示倒计时 + 提供手动关闭按钮。
 
 // ⭐ 面板底部不放「全部取消」按钮：取消在每个任务行上单独操作，
-//    更精确，也不会误伤正在跑的任务。这里是供面板收起时清理完成任务用的。
-async function clearFinishedTasks() {
-    try {
-        await fetch(`${API}/api/tasks/clear`, { method: 'POST' }).catch(() => {});
-    } catch (e) { /* 静默 */ }
-}
+//    更精确，也不会误伤正在跑的任务。服务端已结束任务的清理统一走
+//    hideTaskPanel({ clearTasks: true })（自动收起与手动 × 都会清）。
 
 function startTaskPolling() {
     if (taskTimer) return;
@@ -626,12 +630,19 @@ async function refreshTasks() {
         renderTasks(tasks);
         renderNetSpeed(data.summary?.total_speed_bps || 0, data.summary?.active || 0);
 
+        // 首次拉取完成后武装：__lastTasks 从此是可信的"任务真相"，
+        // SSE 幽灵过滤依赖它（见 applyTaskUpdated）
+        taskEventsArmed = true;
+
         // ⭐ 统一由 updatePanelVisibility 决定显隐：
         //    有下载任务 或 有通知消息 → 显示；都没有 → 收起。
         updatePanelVisibility();
     } catch (e) {
         // 静默失败
         // 兜底：即使请求挂了，倒计时也已排好，仍会按时收起
+        // 拉取失败也武装：宁可退回"事件照常处理"的旧行为，
+        // 也不把实时事件永久屏蔽在门外
+        taskEventsArmed = true;
     }
 }
 
@@ -661,6 +672,21 @@ function updatePanelVisibility() {
     const active = tasks.filter(
         t => t.status === 'pending' || t.status === 'downloading'
     ).length;
+
+    // ⭐ 面板当前是收起状态（典型场景：页面刚加载完，本会话还没有任何任务活动），
+    //    而服务端任务表里可能躺着以往已结束的任务——比如上次下载 / 更新结束后
+    //    用户很快就刷新或关掉了页面，3 秒自动收起还没来得及把它们清掉（或清理
+    //    请求失败）。这些历史记录不该在每次刷新时都把面板弹出来；只有进行中的
+    //    任务才值得打断用户。顺手清掉（本地 + 服务端），避免下一轮轮询再拉一次。
+    if (taskPanelEl().classList.contains('hidden') && active === 0) {
+        if (tasks.length) {
+            hideTaskPanel({ clearTasks: true });
+        } else {
+            stopTaskPolling();
+        }
+        renderNetSpeed(0, 0);
+        return;
+    }
 
     if (!tasks.length && messageCount() === 0) {
         stopTaskPolling();
@@ -2533,6 +2559,69 @@ function applyModelUpdated(d) {
 
 function applyTaskUpdated(task) {
     if (!task) return;
+
+    const finished = task.status !== 'pending' && task.status !== 'downloading';
+
+    // ⭐ 幽灵过滤：SSE 断线重连时会补回放断线期间错过的事件，其中可能躺着
+    //    早已结束任务的"下载中"进度事件（下载中以 0.4s 节流广播，一次下载能
+    //    留下几十上百条）。轮询 /api/tasks 拿到的才是任务列表的真相：武装后，
+    //    真相里不存在的"进行中"任务是历史幽灵——原样处理会弹出任务面板、
+    //    插一个永远不会结束的下载中卡片（刷新页面最常见的复现路径）。
+    //    武装前不过滤：那时收到的事件必然是连接后新产生的。
+    if (!finished && taskEventsArmed) {
+        const truth = window.__lastTasks || [];
+        if (!truth.some(t => t.id === task.id)) return;
+    }
+
+    // ⭐ 已结束的任务（completed / cancelled / error）只更新界面，不改变面板显隐，
+    //    也不进任务列表缓存。两类来源会送达已结束任务：断线重连的补回放、
+    //    以及本页面内刚结束的实时事件。对它们无脑 showTaskPanel() 并塞进
+    //    __lastTasks，会让刷新页面都弹出任务面板（一直显示到自动收起倒计时
+    //    走完）。服务端 /api/tasks 才是任务列表的真相，轮询一到就会用真实
+    //    数据覆盖，回放的历史事件只是"幽灵"。
+    if (finished) {
+        // 先用旧快照判断这条是否"刚结束"（回放的历史事件不在快照里，不会误弹）
+        const oldPrev = window.__prevTasks || [];
+        const oldOne = oldPrev.find(t => t.id === task.id);
+        const justFinished = !!oldOne
+            && (oldOne.status === 'pending' || oldOne.status === 'downloading');
+
+        // 再维护 __prevTasks：让随后的轮询知道这条已提示过，避免重复弹
+        // "下载完成"通知（轮询与 SSE 是两条独立通道，都会走到 toast）。
+        const pi = oldPrev.findIndex(t => t.id === task.id);
+        if (pi >= 0) {
+            oldPrev[pi] = task;
+            window.__prevTasks = oldPrev;
+        }
+
+        // 本页面内刚结束的任务：面板此时开着，卡片要换成结束态
+        const done = document.querySelector(
+            `.task-item[data-task-id="${cssEscape(String(task.id))}"]`
+        );
+        if (done) {
+            const wrapper = document.createElement('div');
+            wrapper.innerHTML = taskCardHtml(task).trim();
+            const newEl = wrapper.firstChild;
+            newEl.dataset.taskId = String(task.id);
+            done.replaceWith(newEl);
+            lastTaskSnapshot = '';   // 下次轮询重绘以服务端数据为准
+        }
+
+        if (justFinished) {
+            if (task.status === 'completed') {
+                toast(`下载完成：${task.filename}`, 'success');
+                // 本地管理页开着的话刷新一下
+                if (document.getElementById('tab-local').classList.contains('active')) {
+                    loadLocalModels();
+                }
+            } else if (task.status === 'error') {
+                toast(`下载失败：${task.filename}（${task.error || '未知错误'}）`, 'error');
+            } else if (task.status === 'cancelled') {
+                toast(`已取消：${task.filename}`, 'info');
+            }
+        }
+        return;
+    }
 
     // 确保任务面板可见（有下载任务就该显示）
     showTaskPanel();
