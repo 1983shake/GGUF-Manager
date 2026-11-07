@@ -71,6 +71,7 @@ def _startup() -> None:
         f"every {settings.update_check_interval_minutes} min "
         f"source={settings.update_check_source}"
     )
+    logger.info(f"  MAX DOWNLOADS    = {settings.max_concurrent_downloads} concurrent")
     logger.info(f"  TIMEZONE         = {get_timezone_name()}")
     logger.info("=" * 62)
 

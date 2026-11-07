@@ -6,7 +6,7 @@
     <title>GGUF 模型管理器</title>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v=2">
     <!-- v=4 版本号：改动静态文件后避免浏览器拿旧缓存 -->
-    <link rel="stylesheet" href="/static/style.css?v=29">
+    <link rel="stylesheet" href="/static/style.css?v=31">
 </head>
 <body>
     <header>
@@ -197,6 +197,17 @@
                 <h3>GGUF 文件列表</h3>
                 <button id="close-modal" class="close-btn">&times;</button>
             </div>
+            <!-- 文件名过滤（纯前端，不重新请求）：只过滤下方文件行 -->
+            <div class="file-filter-bar">
+                <div class="local-filter-wrap">
+                    <input type="text" id="file-filter-input"
+                           placeholder="过滤：文件名（如 Q4_K_M、14B…）"
+                           aria-label="过滤文件名">
+                    <button id="file-filter-clear" class="local-filter-clear"
+                            title="清除过滤" aria-label="清除过滤">&times;</button>
+                </div>
+                <span class="local-view-count" id="file-view-count"></span>
+            </div>
             <div id="gguf-file-list"></div>
             <div class="modal-footer">
                 <button id="cancel-download">关闭</button>
@@ -278,6 +289,18 @@
                             通知消息（下载完成、失败、清理结果等）的显示时长，
                             同时也是全部下载结束后面板自动收起的倒计时。默认 3 秒；
                             鼠标停留会暂停，最多再延长 5 秒；想长时间保留可填 600
+                        </span>
+                    </label>
+                </fieldset>
+
+                <fieldset class="settings-group">
+                    <legend>下载</legend>
+                    <label class="setting-row">
+                        <span class="setting-label">同时下载数量</span>
+                        <input type="number" id="set-max-downloads" min="1" max="16" step="1">
+                        <span class="setting-hint">
+                            限制同时进行的下载任务数（1–16）。超过上限的任务会显示
+                            “排队中”，有任务结束后自动补位。默认 2；填 1 即串行下载
                         </span>
                     </label>
                 </fieldset>
@@ -430,6 +453,6 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=32"></script>
+    <script src="/static/app.js?v=34"></script>
 </body>
 </html>

@@ -375,6 +375,25 @@ class DownloadManager:
     def __init__(self):
         self._tasks: Dict[str, DownloadTask] = {}
         self._lock = threading.Lock()
+        # 并发闸门：限制“真正在跑”的下载数。信号量容量随设置动态调整。
+        self._current_max = max(1, int(settings.get("max_concurrent_downloads", 2) or 2))
+        self._sem = threading.BoundedSemaphore(self._current_max)
+
+    def set_max_concurrent(self, n: int) -> None:
+        """
+        运行时调整并发上限（设置面板保存后调用）。
+
+        线程安全地重建信号量：正在下载的任务不受影响（它们已持有槽位），
+        新任务按新上限排队；调小上限时多出来的任务会继续跑完，
+        之后自然回落到新上限（不强制中断已开始的下载）。
+        """
+        n = max(1, min(16, int(n or 1)))
+        with self._lock:
+            if n == self._current_max:
+                return
+            self._sem = threading.BoundedSemaphore(n)
+            self._current_max = n
+        logger.info(f"[mgr] max concurrent downloads -> {n}")
 
     def start(
         self,
@@ -386,7 +405,7 @@ class DownloadManager:
     ) -> DownloadTask:
         task = DownloadTask(model_id, filename, source, target_dir, token)
 
-        # 同一目标文件已在下载中，直接复用，避免重复写同一个 .part
+        # 同一目标文件已在下载/排队中，直接复用，避免重复写同一个 .part
         with self._lock:
             for t in self._tasks.values():
                 if (
@@ -399,11 +418,30 @@ class DownloadManager:
                     return t
             self._tasks[task.id] = task
 
-        thread = threading.Thread(target=task.run, name=f"dl-{task.id}", daemon=True)
+        thread = threading.Thread(target=self._run_guarded, args=(task,),
+                                  name=f"dl-{task.id}", daemon=True)
         task._thread = thread
         thread.start()
         logger.info(f"[mgr] task started: {task.id} {model_id}/{filename}")
         return task
+
+    def _run_guarded(self, task: DownloadTask) -> None:
+        """
+        先抢并发槽位，再真正下载。
+
+        抢不到槽位的任务保持 `pending`（前端显示“排队中”），等某个下载
+        结束释放槽位后才开始——这就是“限制同时下载数量”的实现。
+        排队期间仍可被 cancel()：cancel 对 pending 任务直接置 cancelled，
+        随后 acquire 醒来发现已取消，直接返回、不占槽位。
+        """
+        sem = self._sem
+        sem.acquire()
+        try:
+            if task.is_cancelled:
+                return  # 排队期间被取消，不启动
+            task.run()
+        finally:
+            sem.release()
 
     def get(self, task_id: str) -> Optional[DownloadTask]:
         with self._lock:

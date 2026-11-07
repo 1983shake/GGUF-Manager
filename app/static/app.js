@@ -432,11 +432,66 @@ function updateSizeRetryVisibility(results) {
 // ============================================================
 // 文件列表弹窗（"查看"）
 // ============================================================
+// 文件名过滤：纯前端，只隐藏不匹配的行，不重新请求。
+// 每次打开新模型时清空过滤条件，避免上一次的残留条件。
+function resetFileFilter() {
+    const input = document.getElementById('file-filter-input');
+    if (input) input.value = '';
+    updateFileFilter();
+}
+
+function updateFileFilter() {
+    const input = document.getElementById('file-filter-input');
+    const countEl = document.getElementById('file-view-count');
+    const fileList = document.getElementById('gguf-file-list');
+    if (!input || !fileList) return;
+
+    const kw = input.value.trim().toLowerCase();
+    const items = fileList.querySelectorAll('.file-item');
+    let shown = 0;
+    items.forEach(item => {
+        const name = (item.dataset.name || '').toLowerCase();
+        const match = !kw || name.includes(kw);
+        item.style.display = match ? '' : 'none';
+        if (match) shown++;
+    });
+
+    if (countEl) {
+        if (!items.length) countEl.textContent = '';
+        else if (!kw) countEl.textContent = `共 ${items.length} 个文件`;
+        else countEl.textContent = `匹配 ${shown} / ${items.length} 个文件`;
+    }
+    // 有过滤词但全部被隐藏时给个提示（复用 empty 样式）
+    const emptyTip = fileList.querySelector('.file-filter-empty');
+    if (kw && shown === 0 && !emptyTip) {
+        const p = document.createElement('p');
+        p.className = 'empty file-filter-empty';
+        p.textContent = '没有匹配该关键词的文件';
+        fileList.appendChild(p);
+    } else if (!kw && emptyTip) {
+        emptyTip.remove();
+    }
+}
+
+// 过滤框事件只绑一次（输入防抖，避免每敲一个字符都遍历）
+(function bindFileFilter() {
+    const input = document.getElementById('file-filter-input');
+    const clearBtn = document.getElementById('file-filter-clear');
+    if (input) input.addEventListener('input', debounce(updateFileFilter, 120));
+    if (clearBtn) {
+        clearBtn.addEventListener('click', () => {
+            if (input) input.value = '';
+            updateFileFilter();
+        });
+    }
+})();
+
 async function openFilesModal(modelId, source) {
     const modal = document.getElementById('download-modal');
     const fileList = document.getElementById('gguf-file-list');
     modal.classList.remove('hidden');
     fileList.innerHTML = '<p class="loading">加载文件列表中...</p>';
+    resetFileFilter();
 
     try {
         const res = await fetch(
@@ -462,7 +517,7 @@ async function openFilesModal(modelId, source) {
                 共 ${data.files.length} 个 GGUF 文件${totalHuman ? ` · 合计 ${escapeHtml(totalHuman)}` : ''}
             </p>
             ${data.files.map(f => `
-                <div class="file-item">
+                <div class="file-item" data-name="${escapeHtml(f.filename)}">
                     <span class="file-name">${escapeHtml(f.filename)}</span>
                     <span class="size">${escapeHtml(f.size_human || '未知')}</span>
                     <button class="start-download"
@@ -474,6 +529,7 @@ async function openFilesModal(modelId, source) {
                 </div>
             `).join('')}
         `;
+        updateFileFilter();
 
         fileList.querySelectorAll('.start-download').forEach(btn => {
             btn.addEventListener('click', async () => {
@@ -1583,6 +1639,7 @@ const SETTING_FIELDS = {
     'set-llama-path': 'llamacpp_reload_path',
     'set-llama-cmd': 'llamacpp_reload_cmd',
     'set-update-interval': 'update_check_interval_minutes',
+    'set-max-downloads': 'max_concurrent_downloads',
 };
 // 下拉型设置（不走统一数字/文本解析）
 const SETTING_SELECTS = {

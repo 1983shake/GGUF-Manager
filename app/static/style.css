@@ -1935,6 +1935,20 @@ button:disabled {
     font-variant-numeric: tabular-nums;
 }
 
+/* 文件列表弹窗内的文件名过滤栏：复用 .local-filter-wrap / .local-view-count */
+.file-filter-bar {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 20px 0;
+    flex-wrap: wrap;
+}
+
+.file-filter-bar .local-filter-wrap input {
+    width: 240px;
+}
+
 /* 可排序表头 */
 .model-table th.sortable {
     cursor: pointer;

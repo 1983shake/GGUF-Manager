@@ -50,6 +50,7 @@ EDITABLE_KEYS = {
     "update_check_enabled",
     "update_check_interval_minutes",
     "update_check_source",
+    "max_concurrent_downloads",
 }
 
 _LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
@@ -81,6 +82,9 @@ DEFAULTS = {
     "update_check_enabled": True,
     "update_check_interval_minutes": 1440,
     "update_check_source": "record",
+    # 同时进行的下载任务数上限。超过上限的任务保持“排队中”，
+    # 有任务结束后自动补位。1 即串行；调大可提高多文件/多模型并发。
+    "max_concurrent_downloads": 2,
 }
 
 REGISTRY_FILENAME = "registry.json"
@@ -110,6 +114,12 @@ def _coerce(key: str, value: Any) -> Any:
             return int(value)
         except (TypeError, ValueError):
             return int(DEFAULTS.get(key, 0))
+    if key == "max_concurrent_downloads":
+        # 并发数有物理意义：至少 1，过大只会挤占带宽与内存，封顶 16
+        try:
+            return max(1, min(16, int(value)))
+        except (TypeError, ValueError):
+            return int(DEFAULTS.get(key, 1))
     if key in _float_keys:
         try:
             return float(value)
