@@ -471,6 +471,8 @@ function updateFileFilter() {
     } else if (!kw && emptyTip) {
         emptyTip.remove();
     }
+    // 过滤改变了可见行 → 同步刷新「全选」三态与已选计数（只统计可见行）
+    if (typeof updateSelectionState === 'function') updateSelectionState();
 }
 
 // 过滤框事件只绑一次（输入防抖，避免每敲一个字符都遍历）
@@ -515,9 +517,21 @@ async function openFilesModal(modelId, source) {
             <p class="file-summary">
                 <strong>${escapeHtml(modelId)}</strong><br>
                 共 ${data.files.length} 个 GGUF 文件${totalHuman ? ` · 合计 ${escapeHtml(totalHuman)}` : ''}
+                <span class="file-select-all-wrap">
+                    <label class="select-all-label" title="勾选 / 取消勾选当前可见的全部文件">
+                        <input type="checkbox" id="file-select-all">
+                        全选
+                    </label>
+                    <span class="file-selected-count" id="file-selected-count"></span>
+                </span>
             </p>
             ${data.files.map(f => `
-                <div class="file-item" data-name="${escapeHtml(f.filename)}">
+                <div class="file-item" data-name="${escapeHtml(f.filename)}"
+                     data-bytes="${Number(f.size) || 0}"
+                     data-id="${escapeHtml(modelId)}" data-source="${escapeHtml(source)}">
+                    <input type="checkbox" class="file-check"
+                           data-file="${escapeHtml(f.filename)}"
+                           title="选择该文件" aria-label="选择 ${escapeHtml(f.filename)}">
                     <span class="file-name">${escapeHtml(f.filename)}</span>
                     <span class="size">${escapeHtml(f.size_human || '未知')}</span>
                     <button class="start-download"
@@ -530,6 +544,7 @@ async function openFilesModal(modelId, source) {
             `).join('')}
         `;
         updateFileFilter();
+        updateSelectionState();
 
         fileList.querySelectorAll('.start-download').forEach(btn => {
             btn.addEventListener('click', async () => {
@@ -573,6 +588,110 @@ document.getElementById('cancel-download').addEventListener('click', () => {
 });
 document.getElementById('close-modal').addEventListener('click', () => {
     document.getElementById('download-modal').classList.add('hidden');
+});
+
+// ============================================================
+// 文件列表弹窗：多选下载
+// ============================================================
+// 勾选状态用事件委托绑在 #gguf-file-list 上——文件行是整表 innerHTML
+// 重绘的（打开新模型 / 过滤），逐节点绑定会丢事件，这里只绑一次。
+// 复选框本身是原生控件，重绘后勾选状态自然清零，无需额外清理。
+
+function visibleFileItems() {
+    const fileList = document.getElementById('gguf-file-list');
+    if (!fileList) return [];
+    return Array.from(fileList.querySelectorAll('.file-item')).filter(
+        item => item.style.display !== 'none'
+    );
+}
+
+/** 依据当前勾选情况刷新「全选」框、已选计数与批量按钮文案/可用性 */
+function updateSelectionState() {
+    const items = visibleFileItems();
+    const checked = items.filter(i => i.querySelector('.file-check')?.checked);
+    const count = checked.length;
+
+    const all = document.getElementById('file-select-all');
+    if (all) {
+        // 三态：全勾 → 勾选；全未勾 → 不勾；部分勾 → 半选（indeterminate）
+        all.checked = items.length > 0 && count === items.length;
+        all.indeterminate = count > 0 && count < items.length;
+    }
+
+    const countEl = document.getElementById('file-selected-count');
+    if (countEl) {
+        const bytes = checked.reduce((s, i) => s + (Number(i.dataset.bytes) || 0), 0);
+        countEl.textContent = count > 0 ? `已选 ${count} 个 · 合计 ${formatSize(bytes)}` : '';
+    }
+
+    const btn = document.getElementById('batch-download');
+    if (btn) {
+        btn.disabled = count === 0;
+        btn.textContent = count > 0 ? `下载所选（${count}）` : '下载所选';
+    }
+}
+
+// 勾选 / 取消勾选（含「全选」框）→ 刷新选中态
+document.getElementById('gguf-file-list')?.addEventListener('change', (e) => {
+    const t = e.target;
+    if (t.id === 'file-select-all') {
+        // 全选框：把当前可见文件行全部设为同一状态
+        const on = t.checked;
+        visibleFileItems().forEach(i => {
+            const c = i.querySelector('.file-check');
+            if (c) c.checked = on;
+        });
+        updateSelectionState();
+        return;
+    }
+    if (t.classList && t.classList.contains('file-check')) {
+        updateSelectionState();
+    }
+});
+
+// 批量下载：收集勾选的文件名，一次性 POST /api/download/batch
+document.getElementById('batch-download').addEventListener('click', async () => {
+    const items = visibleFileItems().filter(i => i.querySelector('.file-check')?.checked);
+    if (!items.length) return;
+
+    const first = items[0];
+    const modelId = first.dataset.id;
+    const source = first.dataset.source;
+    const filenames = items.map(i => i.querySelector('.file-check').dataset.file);
+
+    const btn = document.getElementById('batch-download');
+    btn.disabled = true;
+    const prevText = btn.textContent;
+    btn.textContent = '启动中...';
+
+    try {
+        const r = await fetch(`${API}/api/download/batch`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model_id: modelId, filenames, source }),
+        });
+        const result = await r.json();
+        if (result.error) {
+            toast('批量下载启动失败: ' + result.error, 'error');
+            btn.disabled = false;
+            btn.textContent = prevText;
+            return;
+        }
+        const modal = document.getElementById('download-modal');
+        modal.classList.add('hidden');
+        expandTaskPanel();
+        await refreshTasks();
+        const started = result.started ?? filenames.length;
+        if (result.errors && result.errors.length) {
+            toast(`已启动 ${started} 个下载，${result.errors.length} 个失败`, 'warning');
+        } else {
+            toast(`已启动 ${started} 个下载任务`, 'success');
+        }
+    } catch (e) {
+        toast('请求失败: ' + e.message, 'error');
+        btn.disabled = false;
+        btn.textContent = prevText;
+    }
 });
 
 // ============================================================

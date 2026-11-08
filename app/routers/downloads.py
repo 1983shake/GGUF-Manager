@@ -11,6 +11,7 @@ GET  /api/search/sizes           批量查询多个模型的体积（前端补�
 
 GET  /api/download/files         列出仓库内 GGUF 文件（供“查看”弹窗）
 POST /api/download               启动下载，立即返回 task_id
+POST /api/download/batch         批量启动下载（多选），逐个复用 manager.start()
 
 GET    /api/tasks                列出所有任务 + 全局汇总
 GET    /api/tasks/{id}           单个任务详情
@@ -45,6 +46,17 @@ class DownloadRequest(BaseModel):
 
     model_id: str
     filename: str = ""
+    source: str = "huggingface"
+    target_subdir: str = ""
+
+
+class BatchDownloadRequest(BaseModel):
+    # 多选下载：同一仓库下的一次性勾选多个 GGUF 文件。
+    # 复用 manager.start() 的去重与并发闸门，逐个文件起任务。
+    model_config = ConfigDict(protected_namespaces=())
+
+    model_id: str
+    filenames: list[str] = []
     source: str = "huggingface"
     target_subdir: str = ""
 
@@ -274,6 +286,68 @@ def start_download(req: DownloadRequest):
         "target_dir": target_dir,
         # 直接附带首帧状态，前端不用再等下一次轮询
         "task": task.to_dict(),
+    }
+
+
+@router.post("/api/download/batch")
+def start_batch_download(req: BatchDownloadRequest):
+    """
+    批量启动下载（多选）。
+
+    逐个文件复用 manager.start()：它自带「同 model_id + filename + target_dir
+    去重」与「并发闸门」，所以重复勾选 / 已在下载的文件不会重复起任务，
+    超出并发上限的自动排队。单个文件失败不影响其他文件。
+    """
+    logger.info(
+        f"[/api/download/batch] model_id={req.model_id!r}, "
+        f"filenames={len(req.filenames)}, source={req.source!r}, "
+        f"target_subdir={req.target_subdir!r}"
+    )
+
+    if not req.filenames:
+        return {"error": "请先选择要下载的 GGUF 文件"}
+    if req.source not in SUPPORTED_SOURCES:
+        return {"error": "Unsupported source"}
+
+    try:
+        target_dir = _resolve_target_dir(req.target_subdir)
+    except (ValueError, OSError) as e:
+        return {"error": str(e)}
+
+    # 同一批里可能重复勾选同名文件，先去重避免无谓的重复判断
+    seen = set()
+    filenames = []
+    for name in req.filenames:
+        if name and name not in seen:
+            seen.add(name)
+            filenames.append(name)
+
+    tasks = []
+    errors = []
+    for filename in filenames:
+        try:
+            task = manager.start(
+                model_id=req.model_id,
+                filename=filename,
+                source=req.source,
+                target_dir=target_dir,
+                token=settings.hf_token if req.source == "huggingface" else "",
+            )
+            tasks.append({"filename": filename, "task_id": task.id, "task": task.to_dict()})
+        except Exception as e:
+            logger.warning(f"[/api/download/batch] {filename!r} start failed: {e}")
+            errors.append({"filename": filename, "error": str(e)})
+
+    started = len(tasks)
+    logger.info(f"[/api/download/batch] started {started}/{len(filenames)} -> {target_dir}")
+    return {
+        "status": "started",
+        "started": started,
+        "total": len(filenames),
+        "model_id": req.model_id,
+        "target_dir": target_dir,
+        "tasks": tasks,
+        "errors": errors,
     }
 
 

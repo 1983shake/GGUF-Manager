@@ -486,11 +486,74 @@ button:disabled {
     flex-shrink: 0;
 }
 
+/* 多选下载：文件行左侧复选框 */
+.file-item .file-check {
+    flex-shrink: 0;
+    width: 16px;
+    height: 16px;
+    margin: 0;
+    cursor: pointer;
+    accent-color: #3498db;
+}
+
+/* 文件行 hover 时整行高亮，提示可点击勾选 */
+.file-item:hover {
+    background: #f8fafc;
+}
+
+/* 汇总行里的「全选」与已选计数 */
+.file-select-all-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 12px;
+    margin-left: 12px;
+}
+
+.select-all-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    color: #2c3e50;
+    font-size: 13px;
+    user-select: none;
+}
+
+.select-all-label input {
+    width: 15px;
+    height: 15px;
+    margin: 0;
+    cursor: pointer;
+    accent-color: #3498db;
+}
+
+.file-selected-count {
+    color: #3498db;
+    font-size: 12.5px;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+}
+
+/* 批量下载按钮：用主色蓝，覆盖 .modal-footer button 的灰色 */
+#batch-download {
+    background: #3498db;
+}
+
+#batch-download:hover:not(:disabled) {
+    background: #2980b9;
+}
+
+#batch-download:disabled {
+    background: #95a5a6;
+    cursor: not-allowed;
+}
+
 .modal-footer {
     padding: 12px 20px;
     border-top: 1px solid #ecf0f1;
     display: flex;
     justify-content: flex-end;
+    gap: 12px;
 }
 
 .modal-footer button {
