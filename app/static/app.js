@@ -1417,13 +1417,27 @@ document.getElementById('clear-cache-btn').addEventListener('click', async () =>
 
     try {
         const res = await fetch(`${API}/api/models/clear-cache`, { method: 'POST' });
-        const data = await res.json();
+        const data = await safeJson(res);
+        // data.error 是后端整体异常；部分失败走下面的 failed 逐条展示
+        if (data.__parseError || !res.ok || data.error) {
+            showDeleteFailure(data, res.status);
+            return;
+        }
         const n = (data.deleted || []).length;
         toast(n ? `已清理 ${n} 个缓存文件，释放 ${formatSize(data.freed_bytes || 0)}` : '没有可清理的缓存',
               n ? 'success' : 'info');
+        // ⭐ 旧逻辑完全忽略 failed：被占用/无权限的 .part 静默残留，界面却提示「已清理」
+        const bad = data.failed || [];
+        if (bad.length) {
+            const first = bad[0] || {};
+            toast([
+                `${bad.length} 个缓存文件清理失败：${first.error || '未知原因'}`,
+                first.hint || '',
+            ].filter(Boolean).join('｜'), 'error', 10);
+        }
         await loadLocalModels();
     } catch (e) {
-        toast(`清理失败：${e}`, 'error');
+        toast(`清理失败：${e}`, 'error', 10);
     }
 });
 
@@ -1455,6 +1469,29 @@ function updateBadgeHtml(r) {
     return `<span class="upd-badge ${escapeHtml(r.status)}" title="${escapeHtml(title)}">${escapeHtml(text)}</span>`;
 }
 
+/**
+ * 删除失败统一提示：主因 + 可操作建议 + 原始错误。
+ * ⭐ 错误停留 10 秒，避免任务面板里的 3 秒自动消失让用户「看不到提示」。
+ */
+function showDeleteFailure(data, status) {
+    const err = (data && data.error) || `HTTP ${status}：删除失败`;
+    const hint = (data && data.hint) || '';
+    const detail = (data && data.detail) || '';
+    const parts = [err];
+    if (hint) parts.push(hint);
+    if (detail && detail !== err) parts.push(`原始错误：${detail}`);
+    toast(parts.join('｜'), 'error', 10);
+}
+
+/**
+ * 删除前若自动卸载了 llama.cpp 中正在服务的模型，必须让用户知道服务已停，
+ * 否则会出现「删完文件后 llama.cpp 怎么不响应了」的困惑。
+ */
+function unloadNotice(data) {
+    const n = ((data && data.unload && data.unload.unloaded) || []).length;
+    return n ? `已自动卸载 ${n} 个正在加载的模型，llama.cpp 服务已停止，需要时请重新加载` : '';
+}
+
 function bindLocalEvents(container) {
     // 行选择
     container.querySelectorAll('.row-check').forEach(cb => {
@@ -1474,15 +1511,19 @@ function bindLocalEvents(container) {
                     `${API}/api/models?file_path=${encodeURIComponent(btn.dataset.path)}`,
                     { method: 'DELETE' }
                 );
-                const data = await res.json();
-                if (data.error) {
-                    toast('删除失败: ' + data.error, 'error');
+                const data = await safeJson(res);
+                // ⭐ 任何失败形态都要有可见提示：HTTP 非 2xx / success===false / error / 非 JSON 响应。
+                //    旧逻辑只判 data.error，后端返回 {success:false} 时会误报「已删除」。
+                if (!res.ok || data.__parseError || data.success === false || data.error) {
+                    showDeleteFailure(data, res.status);
                     return;
                 }
-                toast('已删除', 'success');
+                const note = unloadNotice(data);
+                if (note) toast(`已删除｜${note}`, 'info', 10);
+                else toast('已删除', 'success');
                 loadLocalModels();
             } catch (e) {
-                toast('删除请求失败: ' + e.message, 'error');
+                toast('删除请求失败: ' + e.message, 'error', 10);
             }
         });
     });
@@ -1651,10 +1692,25 @@ document.getElementById('batch-delete').addEventListener('click', async () => {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ file_paths: paths }),
         });
-        const r = await res.json();
-        if (r.deleted_count) toast(`已删除 ${r.deleted_count} 个文件`, 'success');
+        const r = await safeJson(res);
+        // 整体异常才提前返回；部分成功/部分失败继续走下面的逐条提示
+        if (r.__parseError || !res.ok || r.error) {
+            showDeleteFailure(r, res.status);
+            loadLocalModels();
+            return;
+        }
+        if (r.deleted_count) {
+            const msg = `已删除 ${r.deleted_count} 个文件`;
+            const note = unloadNotice(r);
+            if (note) toast(`${msg}｜${note}`, 'info', 10);
+            else toast(msg, 'success');
+        }
         if (r.failed && r.failed.length) {
-            toast(`${r.failed.length} 个删除失败：${r.failed[0].error}`, 'error');
+            const first = r.failed[0] || {};
+            toast([
+                `${r.failed.length} 个删除失败：${first.error || '未知原因'}`,
+                first.hint || '',
+            ].filter(Boolean).join('｜'), 'error', 10);
         }
         loadLocalModels();
     } catch (e) {

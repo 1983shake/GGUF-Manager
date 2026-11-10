@@ -27,6 +27,8 @@
 """
 
 import json
+import os
+import stat
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -355,6 +357,98 @@ def scan_models(model_dir: str) -> List[Dict]:
 # ============================================================
 # 删除 / 缓存清理
 # ============================================================
+# Windows 上 unlink 抛 WinError 5 的三类成因：
+#   ① 文件被占用（llama.cpp 的 mmap / 下载线程打开的 .part / 杀软与索引器的瞬时锁）
+#   ② 文件带只读属性（NTFS 下 unlink 同样报「拒绝访问」）
+#   ③ 目录权限不足
+# ②③可直接消除；①里的瞬时锁靠短暂退避重试消除，长期占用则必须给用户可操作的提示。
+#
+# ⭐ 刚卸载 llama.cpp 模型时，POST /models/unload 返回 200 只代表「请求已接受」，
+#    释放 mmap 文件映射是异步的（大模型可达数秒，Docker 文件共享层还会再滞后）。
+#    实测日志：unload 200 → 0.2s 后开始删 → 4 次退避共 1.8s 全部撞在占用窗口内。
+#    因此删除必须按「文件真的可删」轮询到截止时间，不能用固定短重试。
+DELETE_RETRIES = 4
+DELETE_RETRY_DELAY = 0.3          # 0.3 / 0.6 / 0.9s，总退避 <2s（未卸载时快速失败）
+DELETE_WAIT_AFTER_UNLOAD = 15.0   # 卸载成功后等待句柄释放的总窗口（秒）
+DELETE_POLL_INTERVAL = 0.4        # 长等待模式的轮询间隔
+
+
+class DeleteBlockedError(PermissionError):
+    """重试后仍删不掉：文件被占用或权限不足。携带前端可直接展示的中文提示。"""
+
+    def __init__(self, target: Path, detail: str):
+        self.path = str(target)
+        self.detail = detail
+        super().__init__(f"文件被占用或无权限，无法删除：{target.name}")
+
+    def as_dict(self) -> Dict:
+        return {
+            "code": "file_in_use",
+            "error": "文件被占用或无权限，无法删除",
+            "hint": (
+                "请关闭正在使用该文件的程序后重试：正在运行的 llama.cpp / llama-server、"
+                "该文件的下载任务、资源管理器预览或杀毒软件扫描；"
+                "若仍失败，请检查目录权限与文件只读属性。"
+            ),
+            "detail": self.detail,
+        }
+
+
+def _clear_readonly(target: Path) -> None:
+    """NTFS 只读属性会让 unlink 报 WinError 5，删之前先清掉。"""
+    if os.name != "nt":
+        return
+    try:
+        mode = target.stat().st_mode
+        if not (mode & stat.S_IWRITE):
+            os.chmod(target, mode | stat.S_IWRITE)
+            logger.info(f"[local] cleared read-only attribute: {target}")
+    except OSError:
+        pass  # 清不掉也不影响后续 unlink，最终由 DeleteBlockedError 统一报告
+
+
+def _unlink_with_retry(target: Path, wait_seconds: float = 0.0) -> None:
+    """
+    清只读位 + 重试删除。
+
+    wait_seconds <= 0：固定 4 次短退避（缓存清理 / 未卸载模型，快速失败）。
+    wait_seconds >  0：按截止时间轮询，直到文件真的删掉或窗口耗尽。
+
+    ⭐ Windows 上判断「能不能删」的唯一可靠方法就是真的删一次：
+       mmap 占用、只读属性、ACL 都表现为 WinError 5，靠 sleep 猜时长不可靠。
+    """
+    last = "unknown"
+    long_wait = wait_seconds > 0
+    deadline = time.monotonic() + max(0.0, wait_seconds)
+    attempt = 0
+    while True:
+        try:
+            _clear_readonly(target)
+            target.unlink()
+            if attempt:
+                logger.info(f"[local] delete succeeded after {attempt + 1} attempts: {target}")
+            return
+        except FileNotFoundError:
+            return  # 已被别的线程/进程删掉，视为成功
+        except OSError as e:
+            last = f"{type(e).__name__}: {e}"
+            attempt += 1
+            if long_wait:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(DELETE_POLL_INTERVAL, remaining))
+            else:
+                if attempt >= DELETE_RETRIES:
+                    break
+                time.sleep(DELETE_RETRY_DELAY * attempt)
+    logger.warning(
+        f"[local] delete blocked after {attempt} attempts "
+        f"(window={wait_seconds:.1f}s): {target} ({last})"
+    )
+    raise DeleteBlockedError(target, last)
+
+
 def _safe_target(file_path: str, model_dir: str) -> Path:
     """校验路径在模型目录内且是允许删除的类型，返回绝对路径。"""
     target = Path(file_path).resolve()
@@ -363,7 +457,7 @@ def _safe_target(file_path: str, model_dir: str) -> Path:
     try:
         target.relative_to(root)
     except ValueError:
-        raise ValueError("Path outside model directory")
+        raise ValueError("路径不在模型目录内")
 
     name = target.name.lower()
     if not (name.endswith(".gguf") or _is_part(name)):
@@ -371,16 +465,20 @@ def _safe_target(file_path: str, model_dir: str) -> Path:
     return target
 
 
-def delete_model(file_path: str, model_dir: str) -> bool:
-    """删除单个文件（完整模型或 .part 缓存均可），并清掉对应来源记录。"""
+def delete_model(file_path: str, model_dir: str, wait_seconds: float = 0.0) -> bool:
+    """
+    删除单个文件（完整模型或 .part 缓存均可），并清掉对应来源记录。
+
+    wait_seconds > 0：删除前刚卸载了 llama.cpp 模型，轮询等待 mmap 句柄释放。
+    """
     target = _safe_target(file_path, model_dir)
 
     if not target.exists():
         logger.warning(f"[local] delete skipped (not found): {target}")
         return False
 
-    logger.info(f"[local] deleting {target}")
-    target.unlink()
+    logger.info(f"[local] deleting {target} (wait_window={wait_seconds:.1f}s)")
+    _unlink_with_retry(target, wait_seconds=wait_seconds)
     try:
         target.parent.rmdir()
     except OSError:
@@ -408,11 +506,17 @@ def clear_cache(model_dir: str) -> Dict:
         except OSError:
             size = 0
         try:
-            f.unlink()
+            _unlink_with_retry(f)
             deleted.append(str(f.relative_to(root)))
             freed += size
+        except DeleteBlockedError as e:
+            failed.append({"path": str(f), **e.as_dict()})
         except OSError as e:
-            failed.append({"path": str(f), "error": f"{type(e).__name__}: {e}"})
+            failed.append({
+                "path": str(f),
+                "code": "delete_failed",
+                "error": f"删除失败：{e}",
+            })
 
     logger.info(
         f"[local] clear_cache: removed {len(deleted)} part files, "

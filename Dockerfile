@@ -30,6 +30,15 @@ RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ && \
 
 COPY app/ ./app/
 
+# ---------- 版本（唯一来源 app/__init__.py） ----------
+# APP_VERSION 可选：compose 从 .env 传入时做一致性校验（不一致直接构建失败）；
+# 直接 docker build / CI 未传时为空，版本一律以源码 __docker_tag__ 为准，构建不失败。
+# 派生的四字段写入 /app/.release，运行期可查，不另设第二个版本来源。
+ARG APP_VERSION=""
+RUN python -c "import runpy, sys, pathlib; d = runpy.run_path('app/__init__.py'); t = d['__docker_tag__']; v = (sys.argv[1] if len(sys.argv) > 1 else '').strip(); pathlib.Path('/app/.release').write_text('version=' + d['__version__'] + '\nstatus=' + d['__release_status__'] + '\nsequence=' + str(d['__test_sequence__']) + '\ntag=' + t + '\n', encoding='utf-8'); print('[version] ' + t + ' (source: app/__init__.py)'); sys.exit(0 if not v or v == t else '[version] APP_VERSION=' + repr(v) + ' != __docker_tag__=' + repr(t))" "$APP_VERSION"
+LABEL org.opencontainers.image.version="${APP_VERSION}" \
+      org.opencontainers.image.version.source="app/__init__.py"
+
 RUN mkdir -p /app/models /app/config
 
 # ---------- 环境变量 ----------

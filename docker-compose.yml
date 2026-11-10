@@ -6,9 +6,15 @@
 services:
   gguf-manager:
     # 本地构建（用同目录下的 Dockerfile）
-    build: .
-    # 使用已发布镜像时改为下面这行，并注释掉上面的 build
-    #image: docker.cnb.cool/1983shake/gguf-manager:latest
+    # ⭐ 镜像 tag 与构建参数统一取 .env 的 GGUF_DOCKER_TAG，
+    #    而 .env 由 scripts/verify_release.py 从 app/__init__.py 派生，不另设版本来源。
+    build:
+      context: .
+      args:
+        APP_VERSION: ${GGUF_DOCKER_TAG}
+    image: gguf-manager:${GGUF_DOCKER_TAG}
+    # 使用远端镜像时注释掉 build，并把 image 换成：
+    # image: docker.cnb.cool/1983shake/gguf-manager:${GGUF_DOCKER_TAG}
     container_name: gguf-manager
     restart: unless-stopped
 

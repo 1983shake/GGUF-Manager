@@ -17,7 +17,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from app import __version__
+from app import __docker_tag__, __release_status__, __test_sequence__, __version__
 from app.config import REGISTRY_FILENAME, settings
 from app.events import emit_scheduler_tick
 from app.logger import get_logger, get_timezone_name, set_timezone, setup_logging
@@ -113,6 +113,14 @@ async def version():
     """供页脚等处获取版本信息。"""
     return {
         "version": __version__,
+        "release_status": __release_status__,
+        "test_sequence": __test_sequence__,
+        "docker_tag": __docker_tag__,
+        "display": (
+            f"{__version__} 测试版 #{__test_sequence__}"
+            if __release_status__ == "test"
+            else f"{__version__} 正式版"
+        ),
         "name": "GGUF-Manager",
         "repo": "https://github.com/1983shake/GGUF-Manager",
     }

@@ -7,6 +7,37 @@
 
 ---
 
+## [1.4.6] - 2026-11-10
+
+> 合并 1.4.5 之后的 4 次测试迭代并正式发布；
+> 测试期条目已按问题归类整理，不再逐条保留。
+
+### 修复
+
+- **删除本地模型偶发 `[WinError 5] 拒绝访问`，且界面无提示甚至误报「已删除」**：
+  Windows 下 GGUF 文件被 llama.cpp 的 mmap、下载任务或只读属性占用时 `unlink()` 直接抛
+  `PermissionError`，而后端原样返回英文异常、前端只判 `error` 字段，把 `{success:false}`
+  当成了成功。现在删除前清只读位，并 best-effort 卸载「命中待删文件且已加载」的 llama.cpp
+  模型（批量整批只拉一次列表）；卸载后按 15 秒截止时间轮询直到文件真正可删——
+  `POST /models/unload` 返回 200 只代表请求被接受，mmap 释放是异步的，且响应体可能带
+  `error` / `success:false`，必须校验；仍失败则抛 `DeleteBlockedError` 给出中文主因与可操作建议。
+  删除成功后只让 llama.cpp 重扫磁盘清掉记录，**不再** `POST /models/load` 把模型重新拉起占用句柄。
+  接口统一 `{success, code, error, hint, detail}` 并在删前检查是否有下载任务正写该文件，
+  前端做四态失败判定（非 2xx / 非 JSON / `success===false` / `error`），错误停留 10 秒并展示
+  hint，批量删除与缓存清理逐条带原因；占用提示按卸载结果区分，并点明「另有 llama-server
+  占用 / 卸载后被自动重新加载 / Docker 文件共享层持有句柄」等真实原因与对应动作。
+
+### 变更
+
+- **版本与 Docker 交付统一到单一来源**：`app/__init__.py` 的 `__version__` /
+  `__release_status__` / `__test_sequence__` / `__docker_tag__` 是唯一版本源，Docker 构建参数、
+  Compose 镜像名、`.env` / `.env.example`、页脚与 `/api/version` 全部由它派生；新增
+  `scripts/verify_release.py` 做交付前一致性校验（只认非注释的 `image:` 行），Dockerfile
+  构建期比对 `APP_VERSION` 并把四字段写入 `/app/.release`。`APP_VERSION` 改为可选：
+  CI 或直接 `docker build` 未传 `--build-arg` 时以源码为准，不再因空值比对退出 1。
+
+---
+
 ## [1.4.5] - 2026-11-08
 
 ### 新增

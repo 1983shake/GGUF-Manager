@@ -792,3 +792,152 @@ def maybe_reload_after_download(local_path: str) -> dict:
     if not settings.llamacpp_reload_on_download:
         return {"ok": True, "skipped": True, "reason": "未开启下载后自动重载"}
     return reload(local_path, reason="download")
+
+
+# ============================================================
+# 删除流程联动：删前卸载 / 删后重扫
+# ============================================================
+# llama.cpp 路由模式把模型 mmap 进内存，Windows 下该文件被句柄锁住，
+# unlink() 必定抛 WinError 5。删除前先卸载，删后让服务端重扫磁盘。
+#
+# 设计约束：
+#   · best-effort —— 任何异常都不阻塞删除；真删不掉由 local.DeleteBlockedError 报告
+#   · 只卸载「命中待删文件且状态为已加载」的模型，不打扰用户正在用的其它模型
+#   · 不走 _resolve_flavor() 自动探测（最多 3 次 × 10s 网络往返），
+#     直接用短超时探测 /models，普通 llama-server 会快速返回非 200
+#   · 一次调用处理一批路径：/models 只拉一次，批量删除不会 N 倍放大请求
+UNLOAD_CONNECT_TIMEOUT = 2.0
+UNLOAD_READ_TIMEOUT = 5.0
+UNLOAD_MAX_MODELS = 4
+_UNLOADED_STATES = {"", "none", "unloaded", "not_loaded", "idle"}
+
+
+def _is_loaded_status(status: object) -> bool:
+    """未知状态按「已加载」处理：宁可多发一次幂等 unload，也别漏掉占用。"""
+    return str(status or "").strip().lower() not in _UNLOADED_STATES
+
+
+def _match_loaded_ids(file_paths: List[str], entries: List[dict]) -> List[str]:
+    """把本地待删文件名映射到服务端 /models 里已加载的 model id。"""
+    wanted = set()
+    for p in file_paths:
+        # 不依赖 Path：容器里可能收到宿主机的 Windows 风格路径，
+        # Linux 的 Path 不认反斜杠，会把整串当成文件名。
+        name = str(p).replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if not name.endswith(".gguf"):
+            continue  # .part 缓存不会被服务端加载
+        wanted.add(name)
+        wanted.add(name[:-5])  # 去掉 .gguf 的 stem
+
+    hits: List[str] = []
+    for it in entries:
+        mid = str(it.get("id") or "")
+        if not mid or not _is_loaded_status(it.get("status")):
+            continue
+        m = mid.lower()
+        base = (m[:-5] if m.endswith(".gguf") else m).rsplit("/", 1)[-1]
+        if m in wanted or base in wanted:
+            hits.append(mid)
+    return hits[:UNLOAD_MAX_MODELS]
+
+
+def unload_for_delete(file_paths: List[str]) -> dict:
+    """
+    删除前尝试解除加载，释放 mmap 文件句柄。
+
+    返回结构化结果供路由层记录/回传，永不向调用方抛异常。
+    ok=False 只代表「卸载这一步没成功」，调用方仍应继续尝试删除：
+    local.delete_model(wait_seconds=...) 会轮询等待句柄释放，
+    真删不掉会抛 DeleteBlockedError 给中文提示。
+    """
+    result: Dict = {"ok": True, "attempted": [], "unloaded": [], "skipped": None, "errors": []}
+    base = _base()
+    if not settings.llamacpp_enabled or not base:
+        result["skipped"] = "llama.cpp 未启用或未配置地址"
+        return result
+
+    try:
+        with _client(read_timeout=UNLOAD_READ_TIMEOUT, connect_timeout=UNLOAD_CONNECT_TIMEOUT) as c:
+            # ① 路由模式探测 + 取已加载列表，一次请求搞定
+            r = c.get(base + "/models")
+            if r.status_code != 200:
+                result["skipped"] = (
+                    f"服务端无 /models 端点（HTTP {r.status_code}）；"
+                    "普通 llama-server 需停止进程才能释放文件句柄"
+                )
+                return result
+            body = r.json() or {}
+            items = body.get("data") if isinstance(body, dict) else None
+            if not isinstance(items, list):
+                result["skipped"] = "非路由模式（/models 响应格式不符），跳过卸载"
+                return result
+            entries = [
+                {"id": str(it.get("id") or ""), "status": _normalize_status(it)}
+                for it in items
+                if isinstance(it, dict)
+            ]
+
+            ids = _match_loaded_ids(file_paths, entries)
+            result["attempted"] = ids
+            if not ids:
+                result["skipped"] = "待删模型未被加载，无需卸载"
+                return result
+
+            # ② 只卸载命中的模型；复用同一条连接
+            for mid in ids:
+                try:
+                    u = c.post(base + MODELS_UNLOAD_ENDPOINTS[0], json={"model": mid})
+                    body = _shorten(u.text, 200)
+                    logger.info(
+                        f"[llamacpp] pre-delete unload model={mid!r} -> "
+                        f"{u.status_code} {body!r}"
+                    )
+                    if u.status_code in (200, 202, 204):
+                        # ⭐ 部分版本 HTTP 200 但正文带 error / success:false，
+                        #    只认状态码就宣称「已卸载」会误导后续判断。
+                        err = _parse_server_error(body)
+                        if err or '"success":false' in body.replace(" ", "").lower():
+                            result["errors"].append(f"{mid}: 服务端未真正卸载（{err or body}）")
+                        else:
+                            result["unloaded"].append(mid)
+                    elif u.status_code in (400, 404):
+                        # 不认得该 id / 本来就没加载 → 没有占用，等同无需卸载
+                        result["unloaded"].append(mid)
+                    else:
+                        result["errors"].append(f"{mid}: HTTP {u.status_code} {body}")
+                except httpx.HTTPError as e:
+                    result["errors"].append(f"{mid}: {type(e).__name__}: {e}")
+    except (httpx.HTTPError, ValueError, json.JSONDecodeError, AttributeError) as e:
+        result["skipped"] = f"读取服务端模型列表失败：{type(e).__name__}: {e}"
+        result["ok"] = False
+        return result
+    except Exception as e:  # 兜底：卸载是尽力而为，绝不能挡住删除
+        logger.warning(f"[llamacpp] pre-delete unload unexpected error: {e}")
+        result["skipped"] = str(e)
+        result["ok"] = False
+        return result
+
+    result["ok"] = not result["errors"]
+    # ⭐ 不再固定 sleep：mmap 释放时长不可预测，改由 local._unlink_with_retry()
+    #    按 wait_seconds 轮询「文件是否真的可删」，覆盖异步卸载的全部延迟。
+    return result
+
+
+def refresh_after_delete() -> dict:
+    """
+    删除后只让路由模式重扫磁盘，不重新加载任何模型。
+
+    旧逻辑调 reload()（内部会 POST /models/load），会把刚卸载的模型或另一个模型
+    重新拉起，既可能重新占用文件句柄，也不符合删除语义。
+    """
+    base = _base()
+    if not settings.llamacpp_enabled or not base:
+        return {"ok": True, "skipped": True}
+    try:
+        with _client(read_timeout=UNLOAD_READ_TIMEOUT, connect_timeout=UNLOAD_CONNECT_TIMEOUT) as c:
+            r = c.get(base + "/models?reload=1")
+            if r.status_code == 200:
+                return {"ok": True, "method": "refresh", "status_code": 200}
+            return {"ok": False, "skipped": True, "reason": f"HTTP {r.status_code}（非路由模式，无需重扫）"}
+    except httpx.HTTPError as e:
+        return {"ok": False, "skipped": True, "reason": f"{type(e).__name__}: {e}"}
